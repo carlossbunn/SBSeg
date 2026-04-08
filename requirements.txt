@@ -1,0 +1,11 @@
+pyrit>=0.3.0
+nanogcg==0.3.0
+transformers>=4.40.0
+accelerate==1.12.0
+torch
+sentencepiece
+tiktoken
+protobuf
+bitsandbytes
+openai>=1.0.0
+openia
