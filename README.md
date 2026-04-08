@@ -52,19 +52,6 @@ A implementação atual possui as seguintes características:
 ### Modelo alvo
 - `meta-llama/Meta-Llama-3-8B-Instruct`
 
-## Divergências em relação ao ERAD
-
-Embora o ERAD descreva a proposta experimental, o repositório já reflete ajustes de implementação que **devem prevalecer**. Entre os principais pontos:
-
-- O alvo efetivamente configurado no código é **`Meta-Llama-3-8B-Instruct`** em ambos os scripts.
-- A avaliação do alvo é feita localmente via `transformers`, encapsulada em uma classe `HFLocalTarget` compatível com o PyRIT.
-- O fluxo real inclui correções para ambiente offline, carregamento por snapshot local, uso de `chat_template` e compatibilidade com modelos base/instruct.
-- A bateria atualmente usada no código possui **5 prompts**, com **1 variação por prompt**.
-- O projeto está estruturado como experimento de linha de comando com fases separadas:
-  - `download`
-  - `gcg`
-  - `pyrit`
-
 ## Estrutura dos arquivos principais
 
 ```text
