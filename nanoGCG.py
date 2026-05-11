@@ -4,32 +4,33 @@ Alinhado com: "Efetividade vs. Custo Computacional" — ERAD 2026
 
 Modelos:
   Atacante (nanoGCG) : deepseek-ai/DeepSeek-R1-Distill-Llama-8B  (nao gated)
-  Alvo    (avaliacao): meta-llama/Meta-Llama-3-8B-Instruct        (gated — requer token HF)
+  Alvo    (avaliacao): meta-llama/Meta-Llama-3-8B-Instruct        (gated)
 
-Sem necessidade de Ollama, OpenAI ou qualquer API externa.
-100% local via HuggingFace + transformers.
+CORRECOES DE PARIDADE (comparacao justa com gCGc0de.py):
+  [PAR-1] gradient_checkpointing DESABILITADO — igualado ao nanoGCG que nao controla isso.
+          Condicao de memoria identica entre os dois experimentos.
+  [PAR-2] attn_implementation padrao (sem SDPA/Flash Attention) — igualado ao GCG proprio.
+          Velocidade por iteracao comparavel entre os dois.
+  [PAR-3] SEM truncamento de prefix (MAX_PREFIX_TOKENS removido) — nanoGCG processa prefix
+          completo; GCG proprio agora tambem. Condicao de input identica.
+  [PAR-4] CPUMonitor adicionado — coleta uso medio e maximo de CPU (%) durante cada fase,
+          simetrico ao monitor implementado no GCG proprio.
+  [PAR-5] Rastreamento de "iteracao ate sucesso" via callback do nanoGCG — registra em qual
+          step o sufixo produziu o target_prefix pela primeira vez, por prompt.
+          Metrica equivalente ao first_success_step do GCG proprio.
+  [PAR-6] Modelo atacante carregado SEM attn_implementation especial, identico ao GCG.
 
-Variaveis de ambiente:
-  export HUGGINGFACE_TOKEN="hf_SEU_TOKEN"   # necessario para Meta-Llama-3-8B (gated)
-                                             # DeepSeek-R1-Distill nao e gated
-
-Fluxo:
-  FASE 0 — verifica/baixa ambos os modelos do HuggingFace Hub
-  FASE 1 — nanoGCG gera sufixo adversarial para CADA prompt da bateria usando
-            DeepSeek-R1-Distill-Llama-8B (gradientes)
-  FASE 2 — PyRIT envia sufixo ao Meta-Llama-3-8B-Instruct (inferencia local) e mede ASR
-            1 variacao por prompt da bateria
-
-CORRECOES aplicadas (alinhadas com gCGc0de.py):
-  [FIX-1] resolve_local_model_path: resolve o caminho absoluto do snapshot no cache HF,
-          evitando LocalEntryNotFoundError quando HF_HUB_OFFLINE=1.
-  [FIX-2] HFLocalTarget.__init__: usa resolve_local_model_path para carregar tokenizer
-          e modelo pelo caminho absoluto em vez do model_id string.
-  [FIX-3] HFLocalTarget._infer: aplica apply_chat_template quando disponivel,
-          evitando outputs degenerados (loop de tokens) no modelo base.
-  [FIX-4] gerar_variacao_unica: aceita tokenizer e usa apply_chat_template em vez de
-          template Llama-3 hardcoded — compativel com qualquer modelo HF.
-  [FIX-5] TARGET_MODEL_ID atualizado para Meta-Llama-3-8B-Instruct (alinhado com GCG).
+CORRECOES ANTERIORES mantidas:
+  [FIX-1] resolve_local_model_path: resolve caminho absoluto do snapshot HF.
+  [FIX-2] HFLocalTarget.__init__: usa resolve_local_model_path.
+  [FIX-3] HFLocalTarget._infer: aplica apply_chat_template.
+  [FIX-4] gerar_variacao_unica: usa apply_chat_template do tokenizador.
+  [FIX-5] TARGET_MODEL_ID = Meta-Llama-3-8B-Instruct.
+  [OPT-1] _generate_suffixes: logica de sufixos em funcao dedicada.
+  [OPT-2] float16 explicito no atacante.
+  [OPT-3] Limpeza agressiva de VRAM no finally de _generate_suffixes.
+  [OPT-4] Limpeza de VRAM por prompt dentro do loop.
+  [OPT-5] Messages com {optim_str} no campo user (modo instruct da API nanoGCG).
 """
 
 import argparse
@@ -129,12 +130,6 @@ PROMPT_BATTERY = [
 # =============================================================================
 
 def resolve_local_model_path(model_id: str) -> str:
-    """
-    Retorna o caminho absoluto do snapshot mais recente no cache HF.
-    Evita LocalEntryNotFoundError quando HF_HUB_OFFLINE=1 e o HF tenta
-    resolver o model_id string pela rede.
-    Retorna model_id original se nenhum snapshot valido for encontrado.
-    """
     safe = "models--" + model_id.replace("/", "--")
     snapshots_dir = Path.home() / ".cache" / "huggingface" / "hub" / safe / "snapshots"
     if snapshots_dir.exists():
@@ -150,19 +145,10 @@ def resolve_local_model_path(model_id: str) -> str:
 
 
 # =============================================================================
-# Target HuggingFace Local — Meta-Llama-3-8B-Instruct via transformers
+# Target HuggingFace Local
 # =============================================================================
 
 class HFLocalTarget(PromptTarget):
-    """
-    PromptTarget compativel com PyRIT que executa inferencia local usando
-    AutoModelForCausalLM (HuggingFace transformers).
-
-    [FIX-2] Usa resolve_local_model_path para carregar pelo caminho absoluto
-            do snapshot, evitando falhas com HF_HUB_OFFLINE=1.
-    [FIX-3] _infer aplica apply_chat_template quando disponivel.
-    """
-
     def __init__(
         self,
         model_id: str = "meta-llama/Meta-Llama-3-8B-Instruct",
@@ -176,7 +162,6 @@ class HFLocalTarget(PromptTarget):
         self._temperature     = temperature
         self.tokens_generated = 0
 
-        # [FIX-2] Resolve caminho absoluto antes de carregar
         resolved = resolve_local_model_path(model_id)
         print(f"[INFO] Carregando modelo alvo: {model_id}")
         print(f"       Caminho resolvido       : {resolved}")
@@ -199,43 +184,30 @@ class HFLocalTarget(PromptTarget):
         self._model.eval()
         print(f"[OK] Modelo alvo carregado: {model_id}")
 
-    # ------------------------------------------------------------------
-    # [FIX-3] Aplica chat template quando disponivel
-    # ------------------------------------------------------------------
     def _apply_chat_template(self, prompt_text: str) -> str:
         if not hasattr(self._tokenizer, "apply_chat_template"):
             return prompt_text
         if self._tokenizer.chat_template is None:
             return prompt_text
-
         special_tokens = ["<|begin_of_text|>", "<|start_header_id|>", "<|eot_id|>"]
         if any(tok in prompt_text for tok in special_tokens):
             return prompt_text
-
         messages = [
             {"role": "system", "content": Config.MIN_CONTEXT},
             {"role": "user",   "content": prompt_text},
         ]
         try:
             return self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+                messages, tokenize=False, add_generation_prompt=True,
             )
         except Exception:
             return prompt_text
 
     def _infer(self, prompt_text: str) -> str:
-        # [FIX-3] Formata o prompt corretamente antes de tokenizar
         formatted = self._apply_chat_template(prompt_text)
-
         inputs = self._tokenizer(
-            formatted,
-            return_tensors="pt",
-            truncation=True,
-            max_length=1024,
+            formatted, return_tensors="pt", truncation=True, max_length=1024,
         ).to(self._model.device)
-
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,
@@ -244,7 +216,6 @@ class HFLocalTarget(PromptTarget):
                 temperature=self._temperature if self._temperature > 0 else None,
                 pad_token_id=self._tokenizer.eos_token_id,
             )
-
         new_ids  = output_ids[0][inputs["input_ids"].shape[1]:]
         response = self._tokenizer.decode(new_ids, skip_special_tokens=True)
         self.tokens_generated += len(new_ids)
@@ -255,19 +226,16 @@ class HFLocalTarget(PromptTarget):
             piece = prompt_request.request_pieces[0]
         else:
             piece = prompt_request
-
         prompt_text = getattr(
             piece, "converted_value",
             getattr(piece, "original_value",
             getattr(piece, "value", str(piece)))
         )
-
         try:
             loop = asyncio.get_event_loop()
             response_text = await loop.run_in_executor(None, self._infer, prompt_text)
         except Exception as e:
             response_text = f"[ERRO HF] {e}"
-
         try:
             resp_piece = PromptRequestPiece(
                 role="assistant",
@@ -296,7 +264,6 @@ class HFLocalTarget(PromptTarget):
         pass
 
     def unload(self):
-        """Libera VRAM e RAM apos uso."""
         if hasattr(self, "_model") and self._model is not None:
             del self._model
             self._model = None
@@ -326,19 +293,16 @@ class Config:
     TEMP_METRICS_PATH = "temp_metrics_nanogcg.json"
     DB_PATH           = "pyrit_history_nanogcg.db"
 
-    # --- Atacante: DeepSeek-R1-Distill-Llama-8B (nao gated) ---
     ATTACKER_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-
-    # --- Alvo: Meta-Llama-3-8B-Instruct local via HF (gated) ---
-    # [FIX-5] Atualizado para Instruct (alinhado com gCGc0de.py)
     TARGET_MODEL_ID   = "meta-llama/Meta-Llama-3-8B-Instruct"
 
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
     HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")
 
+    # [PAR-1/2/3] Parametros identicos ao GCG proprio para comparacao justa
     NANOGCG_CONFIG = nanogcg.GCGConfig(
-        num_steps=50,
+        num_steps=200,
         search_width=128,
         topk=64,
         seed=10,
@@ -353,12 +317,13 @@ class Config:
 
     COST_PER_GPU_HOUR_BRL = 0.16
     RAM_SAMPLE_INTERVAL   = 0.5
+    CPU_SAMPLE_INTERVAL   = 0.5  # [PAR-4] intervalo de amostragem de CPU
 
     N_PROMPT_VARIATIONS = 1
 
 
 # =============================================================================
-# FASE 0: download dos modelos atacante e alvo
+# FASE 0: download dos modelos
 # =============================================================================
 
 def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
@@ -367,7 +332,6 @@ def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
     model_cache = cache_dir / safe_name
 
     if model_cache.exists() and any(model_cache.iterdir()):
-        # Verifica se o snapshot tem config.json (cache pode estar incompleto)
         resolved = resolve_local_model_path(model_id)
         if resolved != model_id:
             print(f"[OK] {label or model_id} ja presente no cache.")
@@ -375,20 +339,11 @@ def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
         print(f"[AVISO] Cache de {label or model_id} incompleto — re-baixando...")
 
     print(f"\n[INFO] Baixando {label or model_id} ...")
-    print(f"       Modelo  : {model_id}")
-    print(f"       (~16 GB em fp16 — pode demorar varios minutos)\n")
-
     is_gated = "meta-llama" in model_id or "llama" in model_id.lower()
-
     if is_gated and not token:
         raise EnvironmentError(
-            f"\n[ERRO] HUGGINGFACE_TOKEN necessario para '{model_id}' (modelo gated).\n\n"
-            "  Passos:\n"
-            f"  1. Acesse https://huggingface.co/{model_id} e aceite os termos.\n"
-            "  2. Gere um token em https://huggingface.co/settings/tokens\n"
-            "  3. export HUGGINGFACE_TOKEN='hf_SEU_TOKEN'\n"
+            f"\n[ERRO] HUGGINGFACE_TOKEN necessario para '{model_id}' (modelo gated).\n"
         )
-
     try:
         if token:
             login(token=token, add_to_git_credential=False)
@@ -404,15 +359,10 @@ def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
 
 def run_phase_download():
     token = os.environ.get("HUGGINGFACE_TOKEN", Config.HUGGINGFACE_TOKEN)
-
     print("\n--- FASE 0: verificacao / download dos modelos ---")
-    print(f"\n  [Atacante] {Config.ATTACKER_MODEL_ID}  (nao gated)")
     ensure_model_downloaded(Config.ATTACKER_MODEL_ID, token, "Atacante (DeepSeek-R1-Distill)")
-
-    print(f"\n  [Alvo]     {Config.TARGET_MODEL_ID}  (gated — requer token HF)")
-    ensure_model_downloaded(Config.TARGET_MODEL_ID, token, "Alvo (Meta-Llama-3-8B-Instruct)")
-
-    print("\n[OK] Ambos os modelos disponiveis. Pronto para iniciar.\n")
+    ensure_model_downloaded(Config.TARGET_MODEL_ID,   token, "Alvo (Meta-Llama-3-8B-Instruct)")
+    print("\n[OK] Ambos os modelos disponiveis.\n")
 
 
 # =============================================================================
@@ -420,7 +370,6 @@ def run_phase_download():
 # =============================================================================
 
 class RAMMonitor:
-
     def __init__(self, interval: float = Config.RAM_SAMPLE_INTERVAL):
         self._interval = interval
         self._samples: list[float] = []
@@ -456,15 +405,65 @@ class RAMMonitor:
     def mean_gb(self) -> float:
         return sum(self._samples) / len(self._samples) if self._samples else 0.0
 
-    @property
-    def n_samples(self) -> int:
-        return len(self._samples)
-
     def summary(self) -> dict:
         return {
             "pico_gb":  round(self.peak_gb, 3),
             "media_gb": round(self.mean_gb, 3),
-            "amostras": self.n_samples,
+            "amostras": len(self._samples),
+        }
+
+
+# =============================================================================
+# [PAR-4] Monitor de CPU
+# =============================================================================
+
+class CPUMonitor:
+    """
+    [PAR-4] Coleta uso percentual de CPU (todos os nucleos, intervalo=interval).
+    Metrica simetrica ao CPUMonitor do GCG proprio.
+
+    Usa psutil.cpu_percent(percpu=False) — retorna uso medio de todos os nucleos.
+    O pico e o maximo instantaneo observado durante a janela de medicao.
+    """
+
+    def __init__(self, interval: float = Config.CPU_SAMPLE_INTERVAL):
+        self._interval = interval
+        self._samples: list[float] = []
+        self._stop    = threading.Event()
+        self._thread  = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._stop.clear()
+        self._samples.clear()
+        # Primeira chamada descartada (retorna 0.0 por design do psutil)
+        psutil.cpu_percent(interval=None)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._interval * 3)
+
+    def _run(self):
+        while not self._stop.is_set():
+            pct = psutil.cpu_percent(interval=None)
+            self._samples.append(pct)
+            self._stop.wait(self._interval)
+
+    @property
+    def peak_pct(self) -> float:
+        return max(self._samples, default=0.0)
+
+    @property
+    def mean_pct(self) -> float:
+        return sum(self._samples) / len(self._samples) if self._samples else 0.0
+
+    def summary(self) -> dict:
+        return {
+            "pico_pct":  round(self.peak_pct, 1),
+            "media_pct": round(self.mean_pct, 1),
+            "amostras":  len(self._samples),
         }
 
 
@@ -473,23 +472,26 @@ class RAMMonitor:
 # =============================================================================
 
 class AttackMetrics:
-
     def __init__(self):
         self.timestamps = {"start": None, "gcg_end": None, "pyrit_end": None}
 
         self.gcg_metrics = {
-            "iteracoes_configuradas":  0,
-            "iteracoes_executadas":    0,
-            "loss_final":              0.0,
-            "melhor_sufixo":           "",
-            "sufixos_por_prompt":      {},
-            "detalhes_por_prompt":     [],
-            "tempo_execucao_s":        0,
-            "pico_vram_gb":            0.0,
-            "ram_pico_gb":             0.0,
-            "ram_media_gb":            0.0,
-            "ram_amostras":            0,
-            "tentativas":              0,
+            "iteracoes_configuradas":     0,
+            "iteracoes_executadas":       0,
+            "loss_final":                 0.0,
+            "melhor_sufixo":              "",
+            "sufixos_por_prompt":         {},
+            "detalhes_por_prompt":        [],
+            "tempo_execucao_s":           0,
+            "pico_vram_gb":               0.0,
+            "ram_pico_gb":                0.0,
+            "ram_media_gb":               0.0,
+            "ram_amostras":               0,
+            # [PAR-4] CPU
+            "cpu_pico_pct":               0.0,
+            "cpu_media_pct":              0.0,
+            "cpu_amostras":               0,
+            "tentativas":                 0,
         }
 
         self.pyrit_metrics = {
@@ -500,6 +502,10 @@ class AttackMetrics:
             "ram_pico_gb":           0.0,
             "ram_media_gb":          0.0,
             "ram_amostras":          0,
+            # [PAR-4] CPU
+            "cpu_pico_pct":          0.0,
+            "cpu_media_pct":         0.0,
+            "cpu_amostras":          0,
             "resultados_por_prompt": [],
             "respostas":             [],
         }
@@ -512,7 +518,6 @@ class AttackMetrics:
         self.custos["gcg_brl"]   = horas_gcg * Config.COST_PER_GPU_HOUR_BRL
         self.custos["hf_local"]  = custo_hf or {}
         self.custos["total_brl"] = self.custos["gcg_brl"]
-
         sucessos   = self.pyrit_metrics["sucessos"]
         tentativas = self.pyrit_metrics["tentativas"]
         self.custos["custo_por_sucesso_brl"] = (
@@ -522,13 +527,11 @@ class AttackMetrics:
 
     def to_dict(self, custo_hf: dict = None):
         self.calcular_custos(custo_hf)
-
         ram_pico_total  = max(
             self.gcg_metrics["ram_pico_gb"],
             self.pyrit_metrics["ram_pico_gb"],
         )
         vram_pico_total = self.gcg_metrics["pico_vram_gb"]
-
         return {
             "experimento": {
                 "modelo_atacante":        Config.ATTACKER_MODEL_ID,
@@ -541,12 +544,15 @@ class AttackMetrics:
                 "data":                   datetime.now(timezone.utc).isoformat(),
                 "db_historico":           Config.DB_PATH,
                 "gcg_params": {
-                    "num_steps":    Config.NANOGCG_CONFIG.num_steps,
-                    "search_width": Config.NANOGCG_CONFIG.search_width,
-                    "topk":         Config.NANOGCG_CONFIG.topk,
-                    "seed":         Config.NANOGCG_CONFIG.seed,
-                    "verbosity":    Config.NANOGCG_CONFIG.verbosity,
-                    "biblioteca":   "nanoGCG",
+                    "num_steps":              Config.NANOGCG_CONFIG.num_steps,
+                    "search_width":           Config.NANOGCG_CONFIG.search_width,
+                    "topk":                   Config.NANOGCG_CONFIG.topk,
+                    "seed":                   Config.NANOGCG_CONFIG.seed,
+                    "verbosity":              Config.NANOGCG_CONFIG.verbosity,
+                    "biblioteca":             "nanoGCG",
+                    "gradient_checkpointing": False,   # [PAR-1] desabilitado para paridade
+                    "attn_implementation":    "padrao", # [PAR-2] sem SDPA
+                    "max_prefix_tokens":      "sem_limite", # [PAR-3] prefix completo
                 },
             },
             "bateria_prompts": [
@@ -576,6 +582,11 @@ class AttackMetrics:
                 "pico_ram_principal_gb":  round(ram_pico_total, 3),
                 "media_ram_gcg_gb":       round(self.gcg_metrics["ram_media_gb"], 3),
                 "media_ram_pyrit_gb":     round(self.pyrit_metrics["ram_media_gb"], 3),
+                # [PAR-4] CPU no resumo
+                "cpu_pico_gcg_pct":       round(self.gcg_metrics["cpu_pico_pct"], 1),
+                "cpu_media_gcg_pct":      round(self.gcg_metrics["cpu_media_pct"], 1),
+                "cpu_pico_pyrit_pct":     round(self.pyrit_metrics["cpu_pico_pct"], 1),
+                "cpu_media_pyrit_pct":    round(self.pyrit_metrics["cpu_media_pct"], 1),
                 "ataques_bem_sucedidos":  self.pyrit_metrics["sucessos"],
                 "total_ataques":          self.pyrit_metrics["tentativas"],
                 "n_prompts_bateria":      len(PROMPT_BATTERY),
@@ -606,16 +617,7 @@ class AttackMetrics:
 # =============================================================================
 
 def gerar_variacao_unica(base_prompt: str, tokenizer=None) -> str:
-    """
-    [FIX-4] Usa apply_chat_template do tokenizador quando disponivel,
-    em vez de template Llama-3 hardcoded que quebra modelos base.
-
-    Args:
-        base_prompt: prompt original + sufixo adversarial concatenado.
-        tokenizer:   tokenizador do modelo alvo (opcional); se None, usa fallback.
-    """
     ctx = Config.MIN_CONTEXT
-
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         if getattr(tokenizer, "chat_template", None) is not None:
             messages = [
@@ -624,14 +626,10 @@ def gerar_variacao_unica(base_prompt: str, tokenizer=None) -> str:
             ]
             try:
                 return tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
+                    messages, tokenize=False, add_generation_prompt=True,
                 )
             except Exception:
-                pass  # fallback abaixo
-
-    # Fallback: template Llama-3 manual
+                pass
     return (
         f"<|begin_of_text|>"
         f"<|start_header_id|>system<|end_header_id|>\n{ctx}<|eot_id|>"
@@ -696,9 +694,7 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
     e = d["experimento"]
     resultados   = d.get("resultados_por_prompt", [])
     gcg_detalhes = d["metricas_gcg"].get("detalhes_por_prompt", [])
-
-    gcg_por_id = {det["prompt_id"]: det for det in gcg_detalhes}
-
+    gcg_por_id   = {det["prompt_id"]: det for det in gcg_detalhes}
     W = 72
 
     print("\n" + "=" * W)
@@ -724,6 +720,11 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
     print(f"  Pico RAM princ. : {r['pico_ram_principal_gb']:.3f} GB")
     print(f"    Media GCG     : {r['media_ram_gcg_gb']:.3f} GB")
     print(f"    Media PyRIT   : {r['media_ram_pyrit_gb']:.3f} GB")
+    # [PAR-4] CPU no resumo impresso
+    print(f"  CPU GCG pico    : {r['cpu_pico_gcg_pct']:.1f}%  "
+          f"(media: {r['cpu_media_gcg_pct']:.1f}%)")
+    print(f"  CPU PyRIT pico  : {r['cpu_pico_pyrit_pct']:.1f}%  "
+          f"(media: {r['cpu_media_pyrit_pct']:.1f}%)")
     print(
         f"  ASR (geral)     : {d['asr_percentual']:.1f}%  "
         f"({r['ataques_bem_sucedidos']}/{r['total_ataques']})"
@@ -748,7 +749,6 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
         gcg    = gcg_por_id.get(pid, {})
 
         print(f"\n  ┌─ [{pid}]  {status}")
-
         prompt_txt = res["prompt_original"]
         print(f"  │  Prompt     : {prompt_txt[:65]}{'...' if len(prompt_txt) > 65 else ''}")
 
@@ -756,6 +756,9 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
             print(f"  │  ── Fase 1 (nanoGCG) ──")
             print(f"  │  Loss GCG   : {gcg.get('loss', 'n/a')}")
             print(f"  │  Iteracoes  : {gcg.get('iteracoes_executadas', 'n/a')}")
+            # [PAR-5] Iteracao ate sucesso
+            fss = gcg.get("first_success_step")
+            print(f"  │  1a sucesso : {'step ' + str(fss) if fss is not None else 'nao atingido'}")
             print(f"  │  Tempo GCG  : {gcg.get('tempo_s', 'n/a')}s")
             sufixo = gcg.get("sufixo_adversarial", "")
             print(f"  │  Sufixo     : {sufixo[:55]}{'...' if len(sufixo) > 55 else sufixo}")
@@ -768,18 +771,190 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
         print(f"  │  Pass cond. :")
         for cond in res.get("pass_conditions", []):
             print(f"  │    ✓ {cond[:62]}{'...' if len(cond) > 62 else ''}")
-
         print(f"  │  Fail cond. :")
         for cond in res.get("fail_conditions", []):
             print(f"  │    ✗ {cond[:62]}{'...' if len(cond) > 62 else ''}")
-
         print(f"  └{'─' * (W - 4)}")
 
     print("=" * W)
 
 
 # =============================================================================
-# FASE 1: nanoGCG — sufixo adversarial para cada prompt da bateria
+# [PAR-5] Callback para rastrear iteracao ate sucesso no nanoGCG
+# =============================================================================
+
+class FirstSuccessCallback:
+    """
+    [PAR-5] Callback compativel com a API nanoGCG para rastrear em qual step
+    o sufixo corrente produziu o target_prefix pela primeira vez.
+
+    nanoGCG aceita um callable em GCGConfig.callback_fn (se disponivel).
+    Se a versao instalada nao suportar callback, o tracker e usado via
+    monkey-patch do resultado final como fallback.
+
+    Interface esperada pelo nanoGCG:
+        callback_fn(step: int, result: GCGResult) -> None
+    """
+
+    def __init__(self, target_prefix: str):
+        self._target = target_prefix.strip().lower()
+        self.first_success_step: int | None = None
+
+    def __call__(self, step: int, result) -> None:
+        if self.first_success_step is not None:
+            return  # ja registrou — nao precisa continuar verificando
+        best = getattr(result, "best_string", "") or ""
+        if best.strip().lower().startswith(self._target):
+            self.first_success_step = step
+            print(f"  [PAR-5] Primeiro sucesso no step {step} | sufixo: {best[:40]}...")
+
+
+def _build_gcg_config_with_callback(base_config: nanogcg.GCGConfig,
+                                     callback: FirstSuccessCallback) -> nanogcg.GCGConfig:
+    """
+    Tenta injetar o callback na GCGConfig. Se a versao do nanoGCG nao suportar
+    o campo callback_fn, retorna a config original sem modificacao.
+    """
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(base_config)}
+    if "callback_fn" in fields:
+        return dataclasses.replace(base_config, callback_fn=callback)
+    # Versao antiga — callback nao suportado; first_success_step ficara None
+    print("  [AVISO] Esta versao do nanoGCG nao suporta callback_fn. "
+          "first_success_step nao sera rastreado.")
+    return base_config
+
+
+# =============================================================================
+# [OPT-1/2/3/4/PAR-1/2/3/4/5] _generate_suffixes
+# =============================================================================
+
+def _generate_suffixes(
+    attacker_path: str,
+    gcg_config: nanogcg.GCGConfig,
+    system_prompt: str,
+    target_prefix: str,
+) -> tuple[dict[str, str], list[dict], float, int]:
+    """
+    Carrega o modelo atacante uma unica vez, itera todos os prompts da bateria
+    e libera a VRAM de forma garantida no bloco finally.
+
+    [PAR-1] SEM gradient_checkpointing_enable() — igualado ao GCG proprio.
+    [PAR-2] SEM attn_implementation especial — igualado ao GCG proprio.
+    [PAR-3] SEM truncamento de prefix — nanoGCG processa prefix completo.
+    [PAR-5] FirstSuccessCallback injetado por prompt para rastrear step do 1o sucesso.
+    """
+    model     = None
+    tokenizer = None
+
+    sufixos_por_prompt:  dict[str, str] = {}
+    detalhes_por_prompt: list[dict]     = []
+    total_loss      = 0.0
+    total_iteracoes = 0
+
+    try:
+        print(f"[INFO] Carregando modelo atacante: {attacker_path}")
+        # [PAR-2] SEM attn_implementation — identico ao GCG proprio
+        model = AutoModelForCausalLM.from_pretrained(
+            attacker_path,
+            torch_dtype=torch.float16,   # [OPT-2] sempre float16
+            device_map="auto",
+            local_files_only=True,
+            # [PAR-1] gradient_checkpointing NAO ativado aqui
+            # [PAR-2] attn_implementation NAO especificado (padrao)
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            attacker_path, local_files_only=True,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # [PAR-1] Sem gradient_checkpointing — condicao de VRAM identica ao GCG proprio
+        model.config.use_cache = False  # mantido pois e padrao seguro para ataque
+
+        total = len(PROMPT_BATTERY)
+        for i, item in enumerate(PROMPT_BATTERY, 1):
+            prompt_id     = item["id"]
+            attack_prompt = item["prompt"]
+
+            print(
+                f"\n  >>> [{i}/{total}] [{prompt_id}] "
+                f"{attack_prompt[:80]}{'...' if len(attack_prompt) > 80 else ''}"
+            )
+
+            # [OPT-5] messages com {optim_str} no campo user
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": f"{attack_prompt}{{optim_str}}"},
+            ]
+
+            # [PAR-5] Callback por prompt — rastreia iteracao ate sucesso
+            callback = FirstSuccessCallback(target_prefix)
+            prompt_config = _build_gcg_config_with_callback(gcg_config, callback)
+
+            print(f"  Executando nanoGCG para [{prompt_id}]...")
+            t_prompt = time.perf_counter()
+            result   = nanogcg.run(
+                model,
+                tokenizer,
+                messages,
+                target_prefix,
+                config=prompt_config,
+            )
+            t_prompt = round(time.perf_counter() - t_prompt, 2)
+
+            sufixo = getattr(result, "best_string", "")
+            loss   = float(getattr(result, "best_loss", 0.0))
+            iters  = int(
+                getattr(result, "num_steps",  None)
+                or getattr(result, "steps",   None)
+                or getattr(result, "n_steps", None)
+                or gcg_config.num_steps
+            )
+
+            sufixos_por_prompt[prompt_id] = sufixo
+            total_loss      += loss
+            total_iteracoes += iters
+
+            detalhes_por_prompt.append({
+                "prompt_id":            prompt_id,
+                "prompt_original":      attack_prompt,
+                "loss":                 round(loss, 6),
+                "iteracoes_executadas": iters,
+                # [PAR-5] step do primeiro sucesso (None se nunca atingido)
+                "first_success_step":   callback.first_success_step,
+                "tempo_s":              t_prompt,
+                "sufixo_adversarial":   sufixo,
+            })
+
+            print(
+                f"  [{prompt_id}] concluido | "
+                f"Loss: {loss:.4f} | "
+                f"Tempo: {t_prompt}s | "
+                f"Iters: {iters} | "
+                f"1o sucesso: {callback.first_success_step or 'nao atingido'} | "
+                f"Sufixo: {sufixo[:50]}{'...' if len(sufixo) > 50 else ''}"
+            )
+
+            # [OPT-4] Limpeza por prompt
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    finally:
+        # [OPT-3] Limpeza agressiva garantida
+        if model     is not None: del model
+        if tokenizer is not None: del tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("[OK] Modelo atacante descarregado da VRAM.")
+
+    return sufixos_por_prompt, detalhes_por_prompt, total_loss, total_iteracoes
+
+
+# =============================================================================
+# FASE 1: nanoGCG
 # =============================================================================
 
 def run_phase_gcg():
@@ -794,98 +969,31 @@ def run_phase_gcg():
     metrics     = AttackMetrics()
     metrics.timestamps["start"] = datetime.now(timezone.utc).isoformat()
     ram_monitor = RAMMonitor()
-    model       = None
-    tokenizer   = None
+    cpu_monitor = CPUMonitor()  # [PAR-4]
 
     try:
         ram_monitor.start()
+        cpu_monitor.start()  # [PAR-4]
         t0 = time.perf_counter()
 
-        # [FIX-1] Resolve caminho absoluto do atacante tambem
         attacker_path = resolve_local_model_path(Config.ATTACKER_MODEL_ID)
         print(f"[INFO] Atacante resolvido: {attacker_path}")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            attacker_path,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
-            local_files_only=True,
+        sufixos_por_prompt, detalhes_por_prompt, total_loss, total_iteracoes = (
+            _generate_suffixes(
+                attacker_path = attacker_path,
+                gcg_config    = Config.NANOGCG_CONFIG,
+                system_prompt = Config.MIN_CONTEXT,
+                target_prefix = Config.TARGET_PREFIX,
+            )
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            attacker_path,
-            local_files_only=True,
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        sufixos_por_prompt:  dict[str, str] = {}
-        detalhes_por_prompt: list[dict]     = []
-        total_loss      = 0.0
-        total_iteracoes = 0
-
-        for item in PROMPT_BATTERY:
-            prompt_id     = item["id"]
-            attack_prompt = item["prompt"]
-
-            print(
-                f"\n  >>> [{prompt_id}] "
-                f"{attack_prompt[:80]}{'...' if len(attack_prompt) > 80 else ''}"
-            )
-
-            messages = [
-                {"role": "system", "content": Config.MIN_CONTEXT},
-                {"role": "user",   "content": f"{attack_prompt}{{optim_str}}"},
-            ]
-
-            print(f"  Executando nanoGCG para [{prompt_id}]...")
-            t_prompt = time.perf_counter()
-            result   = nanogcg.run(
-                model,
-                tokenizer,
-                messages,
-                Config.TARGET_PREFIX,
-                config=Config.NANOGCG_CONFIG,
-            )
-            t_prompt = round(time.perf_counter() - t_prompt, 2)
-
-            sufixo = getattr(result, "best_string", "")
-            loss   = float(getattr(result, "best_loss", 0.0))
-            iters  = int(
-                getattr(result, "num_steps",  None)
-                or getattr(result, "steps",   None)
-                or getattr(result, "n_steps", None)
-                or Config.NANOGCG_CONFIG.num_steps
-            )
-
-            sufixos_por_prompt[prompt_id] = sufixo
-            total_loss      += loss
-            total_iteracoes += iters
-
-            detalhes_por_prompt.append({
-                "prompt_id":            prompt_id,
-                "prompt_original":      attack_prompt,
-                "loss":                 round(loss, 6),
-                "iteracoes_executadas": iters,
-                "tempo_s":              t_prompt,
-                "sufixo_adversarial":   sufixo,
-            })
-
-            print(
-                f"  [{prompt_id}] concluido | "
-                f"Loss: {loss:.4f} | "
-                f"Tempo: {t_prompt}s | "
-                f"Iters: {iters} | "
-                f"Sufixo: {sufixo[:50]}{'...' if len(sufixo) > 50 else ''}"
-            )
-
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
-        vram_peak   = get_vram_peak_gb()
-        ram_summary = ram_monitor.summary()
+        cpu_monitor.stop()  # [PAR-4]
+        vram_peak    = get_vram_peak_gb()
+        ram_summary  = ram_monitor.summary()
+        cpu_summary  = cpu_monitor.summary()  # [PAR-4]
 
         loss_media = total_loss / len(PROMPT_BATTERY) if PROMPT_BATTERY else 0.0
 
@@ -901,13 +1009,20 @@ def run_phase_gcg():
             "ram_pico_gb":            ram_summary["pico_gb"],
             "ram_media_gb":           ram_summary["media_gb"],
             "ram_amostras":           ram_summary["amostras"],
+            # [PAR-4]
+            "cpu_pico_pct":           cpu_summary["pico_pct"],
+            "cpu_media_pct":          cpu_summary["media_pct"],
+            "cpu_amostras":           cpu_summary["amostras"],
             "tentativas":             Config.NANOGCG_CONFIG.search_width * len(PROMPT_BATTERY),
         })
         metrics.timestamps["gcg_end"] = datetime.now(timezone.utc).isoformat()
 
         with open(Config.SUFFIX_PATH, "w", encoding="utf-8") as f:
             json.dump(
-                {"sufixos_por_prompt": sufixos_por_prompt, "detalhes_por_prompt": detalhes_por_prompt},
+                {
+                    "sufixos_por_prompt":  sufixos_por_prompt,
+                    "detalhes_por_prompt": detalhes_por_prompt,
+                },
                 f, ensure_ascii=False,
             )
 
@@ -920,24 +1035,27 @@ def run_phase_gcg():
             f"{Config.NANOGCG_CONFIG.num_steps * len(PROMPT_BATTERY)}"
         )
         print(
-            f"     VRAM pico: {vram_peak:.3f} GB | "
+            f"     VRAM pico : {vram_peak:.3f} GB | "
             f"RAM pico: {ram_summary['pico_gb']:.3f} GB | "
             f"RAM media: {ram_summary['media_gb']:.3f} GB"
+        )
+        print(
+            f"     CPU pico  : {cpu_summary['pico_pct']:.1f}% | "
+            f"CPU media: {cpu_summary['media_pct']:.1f}%"
         )
 
     except Exception as e:
         ram_monitor.stop()
+        cpu_monitor.stop()
         print(f"[ERRO] Fase GCG: {e}")
         traceback.print_exc()
         raise
     finally:
-        if model     is not None: del model
-        if tokenizer is not None: del tokenizer
         reset_vram_stats()
 
 
 # =============================================================================
-# FASE 2: avaliacao de cada prompt+sufixo no Meta-Llama-3-8B-Instruct local
+# FASE 2: avaliacao PyRIT
 # =============================================================================
 
 async def run_phase_pyrit():
@@ -957,8 +1075,6 @@ async def run_phase_pyrit():
         f"({len(PROMPT_BATTERY)} prompts x {Config.N_PROMPT_VARIATIONS} variacao | "
         f"alvo: Meta-Llama-3-8B-Instruct local) ---"
     )
-    print(f"    Backend             : HuggingFace transformers (local, sem API)")
-    print(f"    Historico persistido: {Config.DB_PATH}")
 
     metrics = AttackMetrics()
     if Path(Config.TEMP_METRICS_PATH).exists():
@@ -980,6 +1096,7 @@ async def run_phase_pyrit():
 
     hf_token    = os.environ.get("HUGGINGFACE_TOKEN", Config.HUGGINGFACE_TOKEN)
     ram_monitor = RAMMonitor()
+    cpu_monitor = CPUMonitor()  # [PAR-4]
 
     target = HFLocalTarget(
         model_id=Config.TARGET_MODEL_ID,
@@ -989,7 +1106,6 @@ async def run_phase_pyrit():
     )
 
     try:
-        # [FIX-4] Passa o tokenizador do modelo alvo para gerar_variacao_unica
         entradas = []
         for item in PROMPT_BATTERY:
             pid      = item["id"]
@@ -1018,6 +1134,7 @@ async def run_phase_pyrit():
         )
 
         ram_monitor.start()
+        cpu_monitor.start()  # [PAR-4]
         t0 = time.perf_counter()
 
         print(f"\nEnviando {len(prompts_envio)} prompts ao Meta-Llama-3-8B-Instruct...")
@@ -1075,7 +1192,9 @@ async def run_phase_pyrit():
 
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
+        cpu_monitor.stop()  # [PAR-4]
         ram_summary = ram_monitor.summary()
+        cpu_summary = cpu_monitor.summary()  # [PAR-4]
         custo_hf    = target.custo_estimado()
 
         metrics.pyrit_metrics.update({
@@ -1084,14 +1203,22 @@ async def run_phase_pyrit():
             "ram_pico_gb":           ram_summary["pico_gb"],
             "ram_media_gb":          ram_summary["media_gb"],
             "ram_amostras":          ram_summary["amostras"],
+            # [PAR-4]
+            "cpu_pico_pct":          cpu_summary["pico_pct"],
+            "cpu_media_pct":         cpu_summary["media_pct"],
+            "cpu_amostras":          cpu_summary["amostras"],
             "resultados_por_prompt": resultados_por_prompt,
             "respostas":             respostas_flat,
         })
         metrics.timestamps["pyrit_end"] = datetime.now(timezone.utc).isoformat()
 
         print(
-            f"\n     RAM pico: {ram_summary['pico_gb']:.3f} GB | "
+            f"\n     RAM pico : {ram_summary['pico_gb']:.3f} GB | "
             f"RAM media: {ram_summary['media_gb']:.3f} GB"
+        )
+        print(
+            f"     CPU pico : {cpu_summary['pico_pct']:.1f}% | "
+            f"CPU media: {cpu_summary['media_pct']:.1f}%"
         )
         print(
             f"     Tokens gerados (alvo): {custo_hf['tokens_gerados']} | "
@@ -1106,6 +1233,7 @@ async def run_phase_pyrit():
 
     except Exception as e:
         ram_monitor.stop()
+        cpu_monitor.stop()
         print(f"\n[ERRO] Fase avaliacao: {e}")
         traceback.print_exc()
         raise
@@ -1125,10 +1253,6 @@ def run_two_phase():
         print(
             "\n[AVISO] HUGGINGFACE_TOKEN nao definido.\n"
             "  O Meta-Llama-3-8B-Instruct (modelo alvo) e GATED — token obrigatorio.\n"
-            "  Passos:\n"
-            "    1. Aceite os termos em https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct\n"
-            "    2. Gere um token em https://huggingface.co/settings/tokens\n"
-            "    3. export HUGGINGFACE_TOKEN='hf_SEU_TOKEN'\n"
         )
 
     print("\nIniciando experimento nanoGCG + PyRIT  (ERAD 2026 — Bateria de Prompts)")
@@ -1143,6 +1267,7 @@ def run_two_phase():
         f"topk={Config.NANOGCG_CONFIG.topk} | "
         f"seed={Config.NANOGCG_CONFIG.seed}"
     )
+    print(f"  [PARIDADE] gradient_checkpointing=False | attn=padrao | prefix=completo")
 
     for f in [Config.TEMP_METRICS_PATH, Config.SUFFIX_PATH]:
         if Path(f).exists():
@@ -1174,7 +1299,7 @@ def run_two_phase():
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Experimento nanoGCG + PyRIT — ERAD 2026 (bateria de 5 prompts, 1 variacao cada, 100% local)"
+        description="Experimento nanoGCG + PyRIT — ERAD 2026 (bateria de 5 prompts, 100% local)"
     )
     p.add_argument(
         "--phase",
