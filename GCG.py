@@ -1,10 +1,11 @@
 """
 Experimento GCG (Greedy Coordinate Gradient) + PyRIT
+Versao com modelos invertidos: Llama/Unsloth como atacante e Qwen como alvo
 Alinhado com: "Efetividade vs. Custo Computacional" — ERAD 2026
 
 Modelos:
-  Atacante (GCG local) : deepseek-ai/DeepSeek-R1-Distill-Llama-8B  (nao gated)
-  Alvo     (avaliacao) : meta-llama/Meta-Llama-3-8B-Instruct        (gated)
+  Atacante (GCG local) : unsloth/Llama-3.2-3B-Instruct
+  Alvo     (avaliacao) : Qwen/Qwen2.5-3B-Instruct
 
 CORRECOES DE PARIDADE (comparacao justa com erad_2026_nanogcg_battery.py):
   [PAR-1] gradient_checkpointing_enable() REMOVIDO — nanoGCG nao controla isso.
@@ -152,7 +153,7 @@ def resolve_local_model_path(model_id: str) -> str:
 class HFLocalTarget(PromptTarget):
     def __init__(
         self,
-        model_id: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+        model_id: str = "Qwen/Qwen2.5-3B-Instruct",
         max_new_tokens: int = 256,
         temperature: float = 0.01,
         hf_token: str = "",
@@ -191,19 +192,26 @@ class HFLocalTarget(PromptTarget):
             return prompt_text
         if self._tokenizer.chat_template is None:
             return prompt_text
-        special_tokens = ["<|begin_of_text|>", "<|start_header_id|>", "<|eot_id|>"]
+        special_tokens = ["<|begin_of_text|>", "<|start_header_id|>", "<|eot_id|>", "<|im_start|>", "<|im_end|>", "<start_of_turn>", "<end_of_turn>"]
         if any(tok in prompt_text for tok in special_tokens):
             return prompt_text
-        messages = [
-            {"role": "system", "content": Config.MIN_CONTEXT},
-            {"role": "user",   "content": prompt_text},
+        candidate_messages = [
+            [
+                {"role": "system", "content": Config.MIN_CONTEXT},
+                {"role": "user",   "content": prompt_text},
+            ],
+            [
+                {"role": "user", "content": f"{Config.MIN_CONTEXT}\n\n{prompt_text}"},
+            ],
         ]
-        try:
-            return self._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-        except Exception:
-            return prompt_text
+        for messages in candidate_messages:
+            try:
+                return self._tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                continue
+        return prompt_text
 
     def _infer(self, prompt_text: str) -> str:
         formatted = self._apply_chat_template(prompt_text)
@@ -290,13 +298,13 @@ class HFLocalTarget(PromptTarget):
 # =============================================================================
 
 class Config:
-    METRICS_JSON_PATH = "relatorio_gcg_deepseek_llama.json"
-    SUFFIX_PATH       = "suffix_gcg_deepseek.json"
-    TEMP_METRICS_PATH = "temp_metrics_gcg.json"
-    DB_PATH           = "pyrit_history_gcg.db"
+    METRICS_JSON_PATH = "relatorio_gcg_llama3b_qwen_ram_vram.json"
+    SUFFIX_PATH       = "suffix_gcg_llama3b_qwen.json"
+    TEMP_METRICS_PATH = "temp_metrics_gcg_llama3b_qwen_ram_vram.json"
+    DB_PATH           = "pyrit_history_gcg_llama3b_qwen.db"
 
-    ATTACKER_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-    TARGET_MODEL_ID   = "meta-llama/Meta-Llama-3-8B-Instruct"
+    ATTACKER_MODEL_ID = "unsloth/Llama-3.2-3B-Instruct"
+    TARGET_MODEL_ID   = "Qwen/Qwen2.5-3B-Instruct"
 
     os.environ.setdefault(
         "PYTORCH_CUDA_ALLOC_CONF",
@@ -306,12 +314,11 @@ class Config:
     HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")
 
     # --- Parametros GCG — identicos ao nanoGCG para comparacao justa ---
-    GCG_NUM_STEPS    = 200
-    GCG_SEARCH_WIDTH = 128
+    GCG_NUM_STEPS    = 250
+    GCG_SEARCH_WIDTH = 256
     GCG_TOPK         = 64
-    GCG_SUFFIX_LEN   = 20
+    GCG_SUFFIX_LEN   = 30
     GCG_SEED         = 10
-
     # [PAR-3] MAX_PREFIX_TOKENS REMOVIDO — prefix processado completo,
     # truncado apenas pelo max_length=1024 do tokenizador (identico ao nanoGCG).
 
@@ -323,10 +330,10 @@ class Config:
 
     COST_PER_GPU_HOUR_BRL = 0.16
     RAM_SAMPLE_INTERVAL   = 0.5
+    VRAM_SAMPLE_INTERVAL  = 0.5  # intervalo de amostragem de VRAM
     CPU_SAMPLE_INTERVAL   = 0.5  # [PAR-4]
 
     N_PROMPT_VARIATIONS = 1
-
 
 # =============================================================================
 # FASE 0: download dos modelos
@@ -342,10 +349,15 @@ def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
         return
 
     print(f"\n[INFO] Baixando {label or model_id} ...")
-    is_gated = "meta-llama" in model_id
+    # So bloqueia automaticamente repositorios oficialmente gated.
+    # O alvo padrao usa o mirror publico da Unsloth.
+    model_lower = model_id.lower()
+    gated_prefixes = ("meta-llama/", "google/gemma")
+    is_gated = model_lower.startswith(gated_prefixes)
     if is_gated and not token:
         raise EnvironmentError(
-            f"\n[ERRO] HUGGINGFACE_TOKEN necessario para '{model_id}' (modelo gated).\n"
+            f"\n[ERRO] HUGGINGFACE_TOKEN necessario para '{model_id}' "
+            "caso o modelo exija aceite/licenca no HuggingFace.\n"
         )
     try:
         if token:
@@ -363,8 +375,8 @@ def ensure_model_downloaded(model_id: str, token: str, label: str = "") -> None:
 def run_phase_download():
     token = os.environ.get("HUGGINGFACE_TOKEN", Config.HUGGINGFACE_TOKEN)
     print("\n--- FASE 0: verificacao / download dos modelos ---")
-    ensure_model_downloaded(Config.ATTACKER_MODEL_ID, token, "Atacante (DeepSeek-R1-Distill)")
-    ensure_model_downloaded(Config.TARGET_MODEL_ID,   token, "Alvo (Meta-Llama-3-8B-Instruct)")
+    ensure_model_downloaded(Config.ATTACKER_MODEL_ID, token, "Atacante (Llama-3.2-3B-Instruct)")
+    ensure_model_downloaded(Config.TARGET_MODEL_ID,   token, "Alvo (Qwen2.5-3B-Instruct)")
     print("\n[OK] Ambos os modelos disponiveis.\n")
 
 
@@ -373,16 +385,244 @@ def run_phase_download():
 # =============================================================================
 
 class RAMMonitor:
+    """
+    Monitora duas coisas ao mesmo tempo:
+      1) RAM RSS do processo Python atual, em GB.
+         - Na fase GCG, representa o processo que executa o gerador de sufixos.
+         - Na fase PyRIT, representa o processo que carrega PyRIT + modelo alvo.
+      2) RAM total usada pelo sistema, em GB, via psutil.virtual_memory().used.
+
+    Os campos de delta mostram quanto a fase realmente aumentou em relacao
+    ao inicio da propria fase: delta = pico - inicio.
+    """
+
     def __init__(self, interval: float = Config.RAM_SAMPLE_INTERVAL):
         self._interval = interval
-        self._samples: list[float] = []
+        self._process_samples: list[float] = []
+        self._system_used_samples: list[float] = []
+        self._system_percent_samples: list[float] = []
         self._stop    = threading.Event()
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._process = psutil.Process(os.getpid())
+        self._process_start_rss_gb = 0.0
+        self._process_end_rss_gb   = 0.0
+        self._system_start_used_gb = 0.0
+        self._system_end_used_gb   = 0.0
+
+    @staticmethod
+    def _gb(value_bytes: int | float) -> float:
+        return float(value_bytes) / (1024 ** 3)
 
     def start(self):
         self._stop.clear()
-        self._samples.clear()
+        self._process_samples.clear()
+        self._system_used_samples.clear()
+        self._system_percent_samples.clear()
+
+        rss_inicio = self._gb(self._process.memory_info().rss)
+        vm = psutil.virtual_memory()
+        self._process_start_rss_gb = rss_inicio
+        self._process_end_rss_gb   = rss_inicio
+        self._system_start_used_gb = self._gb(vm.used)
+        self._system_end_used_gb   = self._system_start_used_gb
+
+        # Amostra inicial explicita para calcular delta real da fase.
+        self._process_samples.append(rss_inicio)
+        self._system_used_samples.append(self._system_start_used_gb)
+        self._system_percent_samples.append(float(vm.percent))
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._interval * 3)
+        try:
+            rss_fim = self._gb(self._process.memory_info().rss)
+        except psutil.NoSuchProcess:
+            rss_fim = self._process_end_rss_gb
+        vm = psutil.virtual_memory()
+        self._process_end_rss_gb = rss_fim
+        self._system_end_used_gb = self._gb(vm.used)
+
+        # Amostra final explicita.
+        self._process_samples.append(rss_fim)
+        self._system_used_samples.append(self._system_end_used_gb)
+        self._system_percent_samples.append(float(vm.percent))
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                rss = self._gb(self._process.memory_info().rss)
+                vm  = psutil.virtual_memory()
+                self._process_samples.append(rss)
+                self._system_used_samples.append(self._gb(vm.used))
+                self._system_percent_samples.append(float(vm.percent))
+            except psutil.NoSuchProcess:
+                break
+            self._stop.wait(self._interval)
+
+    @staticmethod
+    def _mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    @property
+    def peak_gb(self) -> float:
+        return max(self._process_samples, default=0.0)
+
+    @property
+    def mean_gb(self) -> float:
+        return self._mean(self._process_samples)
+
+    @property
+    def system_peak_gb(self) -> float:
+        return max(self._system_used_samples, default=self._system_start_used_gb)
+
+    @property
+    def system_mean_gb(self) -> float:
+        return self._mean(self._system_used_samples)
+
+    @property
+    def system_peak_percent(self) -> float:
+        return max(self._system_percent_samples, default=0.0)
+
+    @property
+    def system_mean_percent(self) -> float:
+        return self._mean(self._system_percent_samples)
+
+    def summary(self) -> dict:
+        processo_inicio = self._process_start_rss_gb
+        processo_fim = self._process_end_rss_gb
+        processo_pico = self.peak_gb
+        processo_media = self.mean_gb
+        processo_delta_pico = max(0.0, processo_pico - processo_inicio)
+
+        sistema_pico = self.system_peak_gb
+        sistema_media = self.system_mean_gb
+        sistema_delta_pico = max(0.0, sistema_pico - self._system_start_used_gb)
+        return {
+            # Compatibilidade com o codigo antigo: estes campos significam RAM absoluta do processo.
+            "pico_gb":  round(processo_pico, 3),
+            "media_gb": round(processo_media, 3),
+            "amostras": len(self._process_samples),
+
+            # RAM absoluta e delta do processo Python da fase.
+            "processo_inicio_gb":     round(processo_inicio, 3),
+            "processo_fim_gb":        round(processo_fim, 3),
+            "processo_pico_gb":       round(processo_pico, 3),
+            "processo_media_gb":      round(processo_media, 3),
+            "processo_delta_pico_gb": round(processo_delta_pico, 3),
+            "processo_amostras":      len(self._process_samples),
+
+            # RAM total usada pelo sistema durante a fase.
+            "sistema_inicio_gb":      round(self._system_start_used_gb, 3),
+            "sistema_fim_gb":         round(self._system_end_used_gb, 3),
+            "sistema_pico_gb":        round(sistema_pico, 3),
+            "sistema_media_gb":       round(sistema_media, 3),
+            "sistema_delta_pico_gb":  round(sistema_delta_pico, 3),
+            "sistema_pico_pct":       round(self.system_peak_percent, 1),
+            "sistema_media_pct":      round(self.system_mean_percent, 1),
+            "sistema_amostras":       len(self._system_used_samples),
+        }
+
+
+
+# =============================================================================
+# Monitor de VRAM
+# =============================================================================
+
+class VRAMMonitor:
+    """
+    Monitora VRAM de forma simetrica ao RAMMonitor:
+      1) VRAM alocada pelo PyTorch no processo atual, em GB.
+      2) VRAM reservada pelo cache do PyTorch, em GB.
+      3) VRAM total usada na(s) GPU(s), em GB, via torch.cuda.mem_get_info().
+
+    Observacao: se houver outros processos usando a GPU, eles entram em
+    vram_sistema_*, mas nao entram em vram_processo_*.
+    """
+
+    def __init__(self, interval: float = Config.VRAM_SAMPLE_INTERVAL):
+        self._interval = interval
+        self._allocated_samples: list[float] = []
+        self._reserved_samples: list[float] = []
+        self._system_used_samples: list[float] = []
+        self._system_percent_samples: list[float] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._allocated_start_gb = 0.0
+        self._allocated_end_gb = 0.0
+        self._reserved_start_gb = 0.0
+        self._reserved_end_gb = 0.0
+        self._system_start_used_gb = 0.0
+        self._system_end_used_gb = 0.0
+
+    @staticmethod
+    def _gb(value_bytes: int | float) -> float:
+        return float(value_bytes) / (1024 ** 3)
+
+    @staticmethod
+    def _mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    @staticmethod
+    def _device_count() -> int:
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    def _reset_peak_stats(self):
+        if not torch.cuda.is_available():
+            return
+        for idx in range(self._device_count()):
+            try:
+                torch.cuda.reset_peak_memory_stats(idx)
+            except Exception:
+                pass
+
+    def _read(self) -> tuple[float, float, float, float]:
+        if not torch.cuda.is_available():
+            return 0.0, 0.0, 0.0, 0.0
+
+        allocated_gb = 0.0
+        reserved_gb = 0.0
+        used_gb = 0.0
+        total_gb = 0.0
+
+        for idx in range(self._device_count()):
+            try:
+                allocated_gb += self._gb(torch.cuda.memory_allocated(idx))
+                reserved_gb += self._gb(torch.cuda.memory_reserved(idx))
+                with torch.cuda.device(idx):
+                    free_b, total_b = torch.cuda.mem_get_info()
+                used_gb += self._gb(total_b - free_b)
+                total_gb += self._gb(total_b)
+            except Exception:
+                continue
+
+        pct = (used_gb / total_gb * 100.0) if total_gb > 0 else 0.0
+        return allocated_gb, reserved_gb, used_gb, pct
+
+    def start(self):
+        self._stop.clear()
+        self._allocated_samples.clear()
+        self._reserved_samples.clear()
+        self._system_used_samples.clear()
+        self._system_percent_samples.clear()
+        self._reset_peak_stats()
+
+        allocated, reserved, system_used, system_pct = self._read()
+        self._allocated_start_gb = allocated
+        self._allocated_end_gb = allocated
+        self._reserved_start_gb = reserved
+        self._reserved_end_gb = reserved
+        self._system_start_used_gb = system_used
+        self._system_end_used_gb = system_used
+
+        self._allocated_samples.append(allocated)
+        self._reserved_samples.append(reserved)
+        self._system_used_samples.append(system_used)
+        self._system_percent_samples.append(system_pct)
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -391,30 +631,166 @@ class RAMMonitor:
         if self._thread.is_alive():
             self._thread.join(timeout=self._interval * 3)
 
+        allocated, reserved, system_used, system_pct = self._read()
+        self._allocated_end_gb = allocated
+        self._reserved_end_gb = reserved
+        self._system_end_used_gb = system_used
+
+        self._allocated_samples.append(allocated)
+        self._reserved_samples.append(reserved)
+        self._system_used_samples.append(system_used)
+        self._system_percent_samples.append(system_pct)
+
     def _run(self):
         while not self._stop.is_set():
-            try:
-                rss = self._process.memory_info().rss / (1024 ** 3)
-                self._samples.append(rss)
-            except psutil.NoSuchProcess:
-                break
+            allocated, reserved, system_used, system_pct = self._read()
+            self._allocated_samples.append(allocated)
+            self._reserved_samples.append(reserved)
+            self._system_used_samples.append(system_used)
+            self._system_percent_samples.append(system_pct)
             self._stop.wait(self._interval)
+
+    def _exact_allocated_peak_gb(self) -> float:
+        if not torch.cuda.is_available():
+            return 0.0
+        total = 0.0
+        for idx in range(self._device_count()):
+            try:
+                total += self._gb(torch.cuda.max_memory_allocated(idx))
+            except Exception:
+                pass
+        return total
 
     @property
     def peak_gb(self) -> float:
-        return max(self._samples, default=0.0)
+        return max(max(self._allocated_samples, default=0.0), self._exact_allocated_peak_gb())
 
     @property
     def mean_gb(self) -> float:
-        return sum(self._samples) / len(self._samples) if self._samples else 0.0
+        return self._mean(self._allocated_samples)
+
+    @property
+    def system_peak_gb(self) -> float:
+        return max(self._system_used_samples, default=self._system_start_used_gb)
+
+    @property
+    def system_mean_gb(self) -> float:
+        return self._mean(self._system_used_samples)
+
+    @property
+    def system_peak_percent(self) -> float:
+        return max(self._system_percent_samples, default=0.0)
+
+    @property
+    def system_mean_percent(self) -> float:
+        return self._mean(self._system_percent_samples)
 
     def summary(self) -> dict:
+        processo_inicio = self._allocated_start_gb
+        processo_fim = self._allocated_end_gb
+        processo_pico = self.peak_gb
+        processo_media = self.mean_gb
+        processo_delta_pico = max(0.0, processo_pico - processo_inicio)
+
+        reservada_inicio = self._reserved_start_gb
+        reservada_fim = self._reserved_end_gb
+        reservada_pico = max(self._reserved_samples, default=reservada_inicio)
+        reservada_media = self._mean(self._reserved_samples)
+        reservada_delta_pico = max(0.0, reservada_pico - reservada_inicio)
+
+        sistema_pico = self.system_peak_gb
+        sistema_media = self.system_mean_gb
+        sistema_delta_pico = max(0.0, sistema_pico - self._system_start_used_gb)
+
         return {
-            "pico_gb":  round(self.peak_gb, 3),
-            "media_gb": round(self.mean_gb, 3),
-            "amostras": len(self._samples),
+            "pico_gb": round(processo_pico, 3),
+            "media_gb": round(processo_media, 3),
+            "amostras": len(self._allocated_samples),
+            "processo_inicio_gb": round(processo_inicio, 3),
+            "processo_fim_gb": round(processo_fim, 3),
+            "processo_pico_gb": round(processo_pico, 3),
+            "processo_media_gb": round(processo_media, 3),
+            "processo_delta_pico_gb": round(processo_delta_pico, 3),
+            "processo_amostras": len(self._allocated_samples),
+            "reservada_inicio_gb": round(reservada_inicio, 3),
+            "reservada_fim_gb": round(reservada_fim, 3),
+            "reservada_pico_gb": round(reservada_pico, 3),
+            "reservada_media_gb": round(reservada_media, 3),
+            "reservada_delta_pico_gb": round(reservada_delta_pico, 3),
+            "reservada_amostras": len(self._reserved_samples),
+            "sistema_inicio_gb": round(self._system_start_used_gb, 3),
+            "sistema_fim_gb": round(self._system_end_used_gb, 3),
+            "sistema_pico_gb": round(sistema_pico, 3),
+            "sistema_media_gb": round(sistema_media, 3),
+            "sistema_delta_pico_gb": round(sistema_delta_pico, 3),
+            "sistema_pico_pct": round(self.system_peak_percent, 1),
+            "sistema_media_pct": round(self.system_mean_percent, 1),
+            "sistema_amostras": len(self._system_used_samples),
         }
 
+
+def empty_vram_metric_fields(alias_key: str | None = None) -> dict:
+    fields = {
+        "pico_vram_gb": 0.0,
+        "vram_pico_gb": 0.0,
+        "vram_media_gb": 0.0,
+        "vram_amostras": 0,
+        "vram_processo_inicio_gb": 0.0,
+        "vram_processo_fim_gb": 0.0,
+        "vram_processo_pico_gb": 0.0,
+        "vram_processo_media_gb": 0.0,
+        "vram_processo_delta_pico_gb": 0.0,
+        "vram_processo_amostras": 0,
+        "vram_reservada_inicio_gb": 0.0,
+        "vram_reservada_fim_gb": 0.0,
+        "vram_reservada_pico_gb": 0.0,
+        "vram_reservada_media_gb": 0.0,
+        "vram_reservada_delta_pico_gb": 0.0,
+        "vram_reservada_amostras": 0,
+        "vram_sistema_inicio_gb": 0.0,
+        "vram_sistema_fim_gb": 0.0,
+        "vram_sistema_pico_gb": 0.0,
+        "vram_sistema_media_gb": 0.0,
+        "vram_sistema_delta_pico_gb": 0.0,
+        "vram_sistema_pico_pct": 0.0,
+        "vram_sistema_media_pct": 0.0,
+        "vram_sistema_amostras": 0,
+    }
+    if alias_key:
+        fields[alias_key] = 0.0
+    return fields
+
+
+def vram_summary_update_fields(summary: dict, alias_key: str | None = None) -> dict:
+    fields = {
+        "pico_vram_gb": summary["pico_gb"],
+        "vram_pico_gb": summary["pico_gb"],
+        "vram_media_gb": summary["media_gb"],
+        "vram_amostras": summary["amostras"],
+        "vram_processo_inicio_gb": summary["processo_inicio_gb"],
+        "vram_processo_fim_gb": summary["processo_fim_gb"],
+        "vram_processo_pico_gb": summary["processo_pico_gb"],
+        "vram_processo_media_gb": summary["processo_media_gb"],
+        "vram_processo_delta_pico_gb": summary["processo_delta_pico_gb"],
+        "vram_processo_amostras": summary["processo_amostras"],
+        "vram_reservada_inicio_gb": summary["reservada_inicio_gb"],
+        "vram_reservada_fim_gb": summary["reservada_fim_gb"],
+        "vram_reservada_pico_gb": summary["reservada_pico_gb"],
+        "vram_reservada_media_gb": summary["reservada_media_gb"],
+        "vram_reservada_delta_pico_gb": summary["reservada_delta_pico_gb"],
+        "vram_reservada_amostras": summary["reservada_amostras"],
+        "vram_sistema_inicio_gb": summary["sistema_inicio_gb"],
+        "vram_sistema_fim_gb": summary["sistema_fim_gb"],
+        "vram_sistema_pico_gb": summary["sistema_pico_gb"],
+        "vram_sistema_media_gb": summary["sistema_media_gb"],
+        "vram_sistema_delta_pico_gb": summary["sistema_delta_pico_gb"],
+        "vram_sistema_pico_pct": summary["sistema_pico_pct"],
+        "vram_sistema_media_pct": summary["sistema_media_pct"],
+        "vram_sistema_amostras": summary["sistema_amostras"],
+    }
+    if alias_key:
+        fields[alias_key] = summary["processo_delta_pico_gb"]
+    return fields
 
 # =============================================================================
 # [PAR-4] Monitor de CPU
@@ -482,10 +858,27 @@ class AttackMetrics:
             "sufixos_por_prompt":         {},
             "detalhes_por_prompt":        [],
             "tempo_execucao_s":           0,
-            "pico_vram_gb":               0.0,
+            **empty_vram_metric_fields("vram_gerador_sufixos_delta_pico_gb"),
+            # Compatibilidade: RAM do processo durante a fase GCG.
             "ram_pico_gb":                0.0,
             "ram_media_gb":               0.0,
             "ram_amostras":               0,
+            # RAM do processo gerador de sufixos.
+            "ram_processo_inicio_gb":     0.0,
+            "ram_processo_fim_gb":        0.0,
+            "ram_processo_pico_gb":       0.0,
+            "ram_processo_media_gb":      0.0,
+            "ram_processo_delta_pico_gb": 0.0,
+            "ram_processo_amostras":      0,
+            # RAM total do sistema durante a fase GCG.
+            "ram_sistema_inicio_gb":      0.0,
+            "ram_sistema_fim_gb":         0.0,
+            "ram_sistema_pico_gb":        0.0,
+            "ram_sistema_media_gb":       0.0,
+            "ram_sistema_delta_pico_gb":  0.0,
+            "ram_sistema_pico_pct":       0.0,
+            "ram_sistema_media_pct":      0.0,
+            "ram_sistema_amostras":       0,
             # [PAR-4] CPU
             "cpu_pico_pct":               0.0,
             "cpu_media_pct":              0.0,
@@ -498,9 +891,27 @@ class AttackMetrics:
             "tentativas":            0,
             "tempo_execucao_s":      0,
             "custo_api":             {},
+            **empty_vram_metric_fields("vram_pyrit_alvo_delta_pico_gb"),
+            # Compatibilidade: RAM do processo durante a fase PyRIT/avaliacao.
             "ram_pico_gb":           0.0,
             "ram_media_gb":          0.0,
             "ram_amostras":          0,
+            # RAM do processo PyRIT + alvo.
+            "ram_processo_inicio_gb":     0.0,
+            "ram_processo_fim_gb":        0.0,
+            "ram_processo_pico_gb":       0.0,
+            "ram_processo_media_gb":      0.0,
+            "ram_processo_delta_pico_gb": 0.0,
+            "ram_processo_amostras":      0,
+            # RAM total do sistema durante a fase PyRIT.
+            "ram_sistema_inicio_gb":      0.0,
+            "ram_sistema_fim_gb":         0.0,
+            "ram_sistema_pico_gb":        0.0,
+            "ram_sistema_media_gb":       0.0,
+            "ram_sistema_delta_pico_gb":  0.0,
+            "ram_sistema_pico_pct":       0.0,
+            "ram_sistema_media_pct":      0.0,
+            "ram_sistema_amostras":       0,
             # [PAR-4] CPU
             "cpu_pico_pct":          0.0,
             "cpu_media_pct":         0.0,
@@ -526,18 +937,30 @@ class AttackMetrics:
 
     def to_dict(self, custo_hf: dict = None):
         self.calcular_custos(custo_hf)
-        ram_pico_total  = max(
-            self.gcg_metrics["ram_pico_gb"],
-            self.pyrit_metrics["ram_pico_gb"],
+        ram_pico_processo_total = max(
+            self.gcg_metrics.get("ram_processo_pico_gb", self.gcg_metrics.get("ram_pico_gb", 0.0)),
+            self.pyrit_metrics.get("ram_processo_pico_gb", self.pyrit_metrics.get("ram_pico_gb", 0.0)),
         )
-        vram_pico_total = self.gcg_metrics["pico_vram_gb"]
+        ram_pico_sistema_total = max(
+            self.gcg_metrics.get("ram_sistema_pico_gb", 0.0),
+            self.pyrit_metrics.get("ram_sistema_pico_gb", 0.0),
+        )
+        vram_pico_processo_total = max(
+            self.gcg_metrics.get("vram_processo_pico_gb", self.gcg_metrics.get("pico_vram_gb", 0.0)),
+            self.pyrit_metrics.get("vram_processo_pico_gb", self.pyrit_metrics.get("pico_vram_gb", 0.0)),
+        )
+        vram_pico_sistema_total = max(
+            self.gcg_metrics.get("vram_sistema_pico_gb", 0.0),
+            self.pyrit_metrics.get("vram_sistema_pico_gb", 0.0),
+        )
+        vram_pico_total = vram_pico_processo_total
         return {
             "experimento": {
                 "modelo_atacante":        Config.ATTACKER_MODEL_ID,
                 "modelo_alvo":            Config.TARGET_MODEL_ID,
                 "backend_alvo":           "HuggingFace transformers (local, sem API)",
                 "gpu":                    "NVIDIA RTX A5500",
-                "metodo":                 "GCG-embedding-direta (DeepSeek-R1-Distill-8B) -> Meta-Llama-3-8B-Instruct local",
+                "metodo":                 f"GCG-embedding-direta ({Config.ATTACKER_MODEL_ID}) -> {Config.TARGET_MODEL_ID} local",
                 "n_prompts_bateria":      len(PROMPT_BATTERY),
                 "n_variacoes_por_prompt": Config.N_PROMPT_VARIATIONS,
                 "data":                   datetime.now(timezone.utc).isoformat(),
@@ -549,9 +972,9 @@ class AttackMetrics:
                     "suffix_len":             Config.GCG_SUFFIX_LEN,
                     "seed":                   Config.GCG_SEED,
                     "grad_strategy":          "embedding_direta",
-                    "gradient_checkpointing": False,   # [PAR-1] removido para paridade
-                    "attn_implementation":    "padrao", # [PAR-2] sem SDPA
-                    "max_prefix_tokens":      "sem_limite", # [PAR-3] prefix completo
+                    "gradient_checkpointing": False,
+                    "attn_implementation":    "padrao",
+                    "max_prefix_tokens":      "sem_limite",
                 },
             },
             "bateria_prompts": [
@@ -578,9 +1001,66 @@ class AttackMetrics:
                     self.gcg_metrics["tempo_execucao_s"]
                     + self.pyrit_metrics["tempo_execucao_s"], 2),
                 "pico_vram_max_gb":       round(vram_pico_total, 3),
-                "pico_ram_principal_gb":  round(ram_pico_total, 3),
-                "media_ram_gcg_gb":       round(self.gcg_metrics["ram_media_gb"], 3),
-                "media_ram_pyrit_gb":     round(self.pyrit_metrics["ram_media_gb"], 3),
+                "pico_vram_processo_max_gb": round(vram_pico_processo_total, 3),
+                "pico_vram_sistema_max_gb":  round(vram_pico_sistema_total, 3),
+
+                # VRAM alocada pelo PyTorch durante o gerador de sufixos.
+                "vram_gerador_sufixos_inicio_gb": round(self.gcg_metrics.get("vram_processo_inicio_gb", 0.0), 3),
+                "vram_gerador_sufixos_fim_gb":    round(self.gcg_metrics.get("vram_processo_fim_gb", 0.0), 3),
+                "vram_gerador_sufixos_pico_gb":   round(self.gcg_metrics.get("vram_processo_pico_gb", 0.0), 3),
+                "vram_gerador_sufixos_media_gb":  round(self.gcg_metrics.get("vram_processo_media_gb", 0.0), 3),
+                "vram_gerador_sufixos_delta_pico_gb": round(self.gcg_metrics.get("vram_processo_delta_pico_gb", 0.0), 3),
+                "vram_gerador_sufixos_reservada_pico_gb": round(self.gcg_metrics.get("vram_reservada_pico_gb", 0.0), 3),
+
+                # VRAM alocada pelo PyTorch durante PyRIT + modelo alvo.
+                "vram_pyrit_alvo_inicio_gb": round(self.pyrit_metrics.get("vram_processo_inicio_gb", 0.0), 3),
+                "vram_pyrit_alvo_fim_gb":    round(self.pyrit_metrics.get("vram_processo_fim_gb", 0.0), 3),
+                "vram_pyrit_alvo_pico_gb":   round(self.pyrit_metrics.get("vram_processo_pico_gb", 0.0), 3),
+                "vram_pyrit_alvo_media_gb":  round(self.pyrit_metrics.get("vram_processo_media_gb", 0.0), 3),
+                "vram_pyrit_alvo_delta_pico_gb": round(self.pyrit_metrics.get("vram_processo_delta_pico_gb", 0.0), 3),
+                "vram_pyrit_alvo_reservada_pico_gb": round(self.pyrit_metrics.get("vram_reservada_pico_gb", 0.0), 3),
+
+                # VRAM total da GPU nas duas fases, incluindo cache/driver/outros processos.
+                "vram_sistema_gcg_inicio_gb": round(self.gcg_metrics.get("vram_sistema_inicio_gb", 0.0), 3),
+                "vram_sistema_gcg_pico_gb":   round(self.gcg_metrics.get("vram_sistema_pico_gb", 0.0), 3),
+                "vram_sistema_gcg_media_gb":  round(self.gcg_metrics.get("vram_sistema_media_gb", 0.0), 3),
+                "vram_sistema_gcg_delta_pico_gb": round(self.gcg_metrics.get("vram_sistema_delta_pico_gb", 0.0), 3),
+                "vram_sistema_pyrit_inicio_gb": round(self.pyrit_metrics.get("vram_sistema_inicio_gb", 0.0), 3),
+                "vram_sistema_pyrit_pico_gb":   round(self.pyrit_metrics.get("vram_sistema_pico_gb", 0.0), 3),
+                "vram_sistema_pyrit_media_gb":  round(self.pyrit_metrics.get("vram_sistema_media_gb", 0.0), 3),
+                "vram_sistema_pyrit_delta_pico_gb": round(self.pyrit_metrics.get("vram_sistema_delta_pico_gb", 0.0), 3),
+
+                "pico_ram_principal_gb":  round(ram_pico_processo_total, 3),
+                "pico_ram_processo_max_gb": round(ram_pico_processo_total, 3),
+                "pico_ram_sistema_max_gb":  round(ram_pico_sistema_total, 3),
+
+                # RAM usada pelo gerador de sufixos: delta do processo.
+                "ram_gerador_sufixos_inicio_gb": round(self.gcg_metrics.get("ram_processo_inicio_gb", 0.0), 3),
+                "ram_gerador_sufixos_fim_gb":    round(self.gcg_metrics.get("ram_processo_fim_gb", 0.0), 3),
+                "ram_gerador_sufixos_pico_gb":   round(self.gcg_metrics.get("ram_processo_pico_gb", 0.0), 3),
+                "ram_gerador_sufixos_media_gb":  round(self.gcg_metrics.get("ram_processo_media_gb", 0.0), 3),
+                "ram_gerador_sufixos_delta_pico_gb": round(self.gcg_metrics.get("ram_processo_delta_pico_gb", 0.0), 3),
+
+                # RAM usada pelo PyRIT + modelo alvo: delta do processo.
+                "ram_pyrit_alvo_inicio_gb": round(self.pyrit_metrics.get("ram_processo_inicio_gb", 0.0), 3),
+                "ram_pyrit_alvo_fim_gb":    round(self.pyrit_metrics.get("ram_processo_fim_gb", 0.0), 3),
+                "ram_pyrit_alvo_pico_gb":   round(self.pyrit_metrics.get("ram_processo_pico_gb", 0.0), 3),
+                "ram_pyrit_alvo_media_gb":  round(self.pyrit_metrics.get("ram_processo_media_gb", 0.0), 3),
+                "ram_pyrit_alvo_delta_pico_gb": round(self.pyrit_metrics.get("ram_processo_delta_pico_gb", 0.0), 3),
+
+                # RAM do sistema nas duas fases.
+                "ram_sistema_gcg_inicio_gb": round(self.gcg_metrics.get("ram_sistema_inicio_gb", 0.0), 3),
+                "ram_sistema_gcg_pico_gb":   round(self.gcg_metrics.get("ram_sistema_pico_gb", 0.0), 3),
+                "ram_sistema_gcg_media_gb":  round(self.gcg_metrics.get("ram_sistema_media_gb", 0.0), 3),
+                "ram_sistema_gcg_delta_pico_gb": round(self.gcg_metrics.get("ram_sistema_delta_pico_gb", 0.0), 3),
+                "ram_sistema_pyrit_inicio_gb": round(self.pyrit_metrics.get("ram_sistema_inicio_gb", 0.0), 3),
+                "ram_sistema_pyrit_pico_gb":   round(self.pyrit_metrics.get("ram_sistema_pico_gb", 0.0), 3),
+                "ram_sistema_pyrit_media_gb":  round(self.pyrit_metrics.get("ram_sistema_media_gb", 0.0), 3),
+                "ram_sistema_pyrit_delta_pico_gb": round(self.pyrit_metrics.get("ram_sistema_delta_pico_gb", 0.0), 3),
+
+                # Campos antigos mantidos para comparacao/compatibilidade.
+                "media_ram_gcg_gb":       round(self.gcg_metrics.get("ram_media_gb", 0.0), 3),
+                "media_ram_pyrit_gb":     round(self.pyrit_metrics.get("ram_media_gb", 0.0), 3),
                 # [PAR-4] CPU no resumo
                 "cpu_pico_gcg_pct":       round(self.gcg_metrics["cpu_pico_pct"], 1),
                 "cpu_media_gcg_pct":      round(self.gcg_metrics["cpu_media_pct"], 1),
@@ -762,7 +1242,7 @@ class GCGAttack:
         first_success_step: int | None = None
 
         print(
-            f"  GCG [embedding direta | DeepSeek-R1-Distill]: "
+            f"  GCG [embedding direta | Llama-3.2-3B]: "
             f"{self.num_steps} iteracoes | "
             f"suffix_len={self.suffix_len} | topk={self.topk} | "
             f"batch={self.search_width}"
@@ -855,22 +1335,23 @@ def gerar_variacao_unica(base_prompt: str, tokenizer=None) -> str:
     ctx = Config.MIN_CONTEXT
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         if getattr(tokenizer, "chat_template", None) is not None:
-            messages = [
-                {"role": "system", "content": ctx},
-                {"role": "user",   "content": base_prompt},
+            candidate_messages = [
+                [
+                    {"role": "system", "content": ctx},
+                    {"role": "user",   "content": base_prompt},
+                ],
+                [
+                    {"role": "user", "content": f"{ctx}\n\n{base_prompt}"},
+                ],
             ]
-            try:
-                return tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                )
-            except Exception:
-                pass
-    return (
-        f"<|begin_of_text|>"
-        f"<|start_header_id|>system<|end_header_id|>\n{ctx}<|eot_id|>"
-        f"<|start_header_id|>user<|end_header_id|>\n{base_prompt}<|eot_id|>"
-        f"<|start_header_id|>assistant<|end_header_id|>"
-    )
+            for messages in candidate_messages:
+                try:
+                    return tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                    )
+                except Exception:
+                    continue
+    return f"System: {ctx}\nUser: {base_prompt}\nAssistant:"
 
 
 # =============================================================================
@@ -944,7 +1425,7 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
     resultados   = d.get("resultados_por_prompt", [])
     gcg_detalhes = d["metricas_gcg"].get("detalhes_por_prompt", [])
     gcg_por_id   = {det["prompt_id"]: det for det in gcg_detalhes}
-    W = 72
+    W = 78
 
     print("\n" + "=" * W)
     print("RESUMO DO EXPERIMENTO  (GCG — ERAD 2026 — BATERIA DE PROMPTS)")
@@ -961,16 +1442,71 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
         f"batch={e['gcg_params']['search_width']} | "
         f"topk={e['gcg_params']['topk']} | "
         f"suffix_len={e['gcg_params']['suffix_len']}"
-        # [PAR-3] sem max_prefix_tok — prefix completo
     )
     print(f"  Iteracoes conf. : {d['metricas_gcg']['iteracoes_configuradas']}")
     print(f"  Iteracoes reais : {d['metricas_gcg']['iteracoes_executadas']}")
     print(f"  Tempo Total     : {r['tempo_total_s']}s")
     print(f"  Pico VRAM GPU   : {r['pico_vram_max_gb']:.3f} GB")
-    print(f"  Pico RAM princ. : {r['pico_ram_principal_gb']:.3f} GB")
-    print(f"    Media GCG     : {r['media_ram_gcg_gb']:.3f} GB")
-    print(f"    Media PyRIT   : {r['media_ram_pyrit_gb']:.3f} GB")
-    # [PAR-4] CPU
+    print("-" * W)
+    print("  VRAM usada pela fase — DELTA DO PROCESSO PyTorch (pico menos inicio)")
+    print(
+        f"    Gerador GCG   : usada={r['vram_gerador_sufixos_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['vram_gerador_sufixos_inicio_gb']:.3f} GB | "
+        f"pico={r['vram_gerador_sufixos_pico_gb']:.3f} GB | "
+        f"media={r['vram_gerador_sufixos_media_gb']:.3f} GB"
+    )
+    print(
+        f"    PyRIT + alvo  : usada={r['vram_pyrit_alvo_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['vram_pyrit_alvo_inicio_gb']:.3f} GB | "
+        f"pico={r['vram_pyrit_alvo_pico_gb']:.3f} GB | "
+        f"media={r['vram_pyrit_alvo_media_gb']:.3f} GB"
+    )
+    print("  VRAM reservada pelo PyTorch — pico")
+    print(
+        f"    Gerador GCG   : reservada_pico={r['vram_gerador_sufixos_reservada_pico_gb']:.3f} GB | "
+        f"PyRIT + alvo={r['vram_pyrit_alvo_reservada_pico_gb']:.3f} GB"
+    )
+    print("  VRAM total da GPU — DELTA DO SISTEMA GPU (pico menos inicio)")
+    print(
+        f"    Durante GCG   : delta={r['vram_sistema_gcg_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['vram_sistema_gcg_inicio_gb']:.3f} GB | "
+        f"pico={r['vram_sistema_gcg_pico_gb']:.3f} GB | "
+        f"media={r['vram_sistema_gcg_media_gb']:.3f} GB"
+    )
+    print(
+        f"    Durante PyRIT : delta={r['vram_sistema_pyrit_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['vram_sistema_pyrit_inicio_gb']:.3f} GB | "
+        f"pico={r['vram_sistema_pyrit_pico_gb']:.3f} GB | "
+        f"media={r['vram_sistema_pyrit_media_gb']:.3f} GB"
+    )
+    print("-" * W)
+    print("  RAM usada pela fase — DELTA DO PROCESSO (pico menos inicio)")
+    print(
+        f"    Gerador GCG   : usada={r['ram_gerador_sufixos_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['ram_gerador_sufixos_inicio_gb']:.3f} GB | "
+        f"pico={r['ram_gerador_sufixos_pico_gb']:.3f} GB | "
+        f"media={r['ram_gerador_sufixos_media_gb']:.3f} GB"
+    )
+    print(
+        f"    PyRIT + alvo  : usada={r['ram_pyrit_alvo_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['ram_pyrit_alvo_inicio_gb']:.3f} GB | "
+        f"pico={r['ram_pyrit_alvo_pico_gb']:.3f} GB | "
+        f"media={r['ram_pyrit_alvo_media_gb']:.3f} GB"
+    )
+    print("  RAM total do sistema — DELTA DO SISTEMA (pico menos inicio)")
+    print(
+        f"    Durante GCG   : delta={r['ram_sistema_gcg_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['ram_sistema_gcg_inicio_gb']:.3f} GB | "
+        f"pico={r['ram_sistema_gcg_pico_gb']:.3f} GB | "
+        f"media={r['ram_sistema_gcg_media_gb']:.3f} GB"
+    )
+    print(
+        f"    Durante PyRIT : delta={r['ram_sistema_pyrit_delta_pico_gb']:.3f} GB | "
+        f"inicio={r['ram_sistema_pyrit_inicio_gb']:.3f} GB | "
+        f"pico={r['ram_sistema_pyrit_pico_gb']:.3f} GB | "
+        f"media={r['ram_sistema_pyrit_media_gb']:.3f} GB"
+    )
+    print("-" * W)
     print(f"  CPU GCG pico    : {r['cpu_pico_gcg_pct']:.1f}%  "
           f"(media: {r['cpu_media_gcg_pct']:.1f}%)")
     print(f"  CPU PyRIT pico  : {r['cpu_pico_pyrit_pct']:.1f}%  "
@@ -1006,7 +1542,6 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
             print(f"  │  ── Fase 1 (GCG) ──")
             print(f"  │  Loss GCG   : {gcg.get('loss', 'n/a')}")
             print(f"  │  Iteracoes  : {gcg.get('iteracoes_executadas', 'n/a')}")
-            # [PAR-5] Iteracao ate sucesso
             fss = gcg.get("first_success_step")
             print(f"  │  1a sucesso : {'step ' + str(fss) if fss is not None else 'nao atingido'}")
             print(f"  │  Tempo GCG  : {gcg.get('tempo_s', 'n/a')}s")
@@ -1045,18 +1580,20 @@ def run_phase_gcg():
 
     print(
         f"\n--- FASE 1: GCG — bateria de {len(PROMPT_BATTERY)} prompts "
-        f"(atacante: DeepSeek-R1-Distill-Llama-8B) ---"
+        f"(atacante: Llama-3.2-3B-Instruct) ---"
     )
 
     metrics     = AttackMetrics()
     metrics.timestamps["start"] = datetime.now(timezone.utc).isoformat()
     ram_monitor = RAMMonitor()
+    vram_monitor = VRAMMonitor()
     cpu_monitor = CPUMonitor()  # [PAR-4]
     model       = None
     tokenizer   = None
 
     try:
         ram_monitor.start()
+        vram_monitor.start()
         cpu_monitor.start()  # [PAR-4]
         t0 = time.perf_counter()
 
@@ -1096,14 +1633,18 @@ def run_phase_gcg():
 
             print(f"\n  >>> [{prompt_id}] {attack_prompt[:80]}{'...' if len(attack_prompt)>80 else ''}")
 
-            # [PAR-3] prefix sem truncamento manual — tokenizado com max_length=1024
-            prefix_text = (
-                f"<|begin_of_text|>"
-                f"<|start_header_id|>system<|end_header_id|>\n"
-                f"{Config.MIN_CONTEXT}<|eot_id|>"
-                f"<|start_header_id|>user<|end_header_id|>\n"
-                f"{attack_prompt}"
-            )
+            # [PAR-3] Prefix sem truncamento manual. Usa chat_template do atacante
+            # quando disponivel, para funcionar corretamente com Qwen/Llama.
+            messages = [
+                {"role": "system", "content": Config.MIN_CONTEXT},
+                {"role": "user",   "content": attack_prompt},
+            ]
+            try:
+                prefix_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                prefix_text = f"System: {Config.MIN_CONTEXT}\nUser: {attack_prompt}\nAssistant:"
 
             attacker = GCGAttack(
                 model=model,
@@ -1149,9 +1690,11 @@ def run_phase_gcg():
 
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
+        vram_monitor.stop()
         cpu_monitor.stop()  # [PAR-4]
-        vram_peak   = get_vram_peak_gb()
         ram_summary = ram_monitor.summary()
+        vram_summary = vram_monitor.summary()
+        vram_peak   = vram_summary["pico_gb"]
         cpu_summary = cpu_monitor.summary()  # [PAR-4]
 
         loss_media = total_loss / len(PROMPT_BATTERY) if PROMPT_BATTERY else 0.0
@@ -1164,10 +1707,24 @@ def run_phase_gcg():
             "sufixos_por_prompt":     sufixos_por_prompt,
             "detalhes_por_prompt":    detalhes_por_prompt,
             "tempo_execucao_s":       round(dt, 2),
-            "pico_vram_gb":           round(vram_peak, 3),
+            **vram_summary_update_fields(vram_summary, "vram_gerador_sufixos_delta_pico_gb"),
             "ram_pico_gb":            ram_summary["pico_gb"],
             "ram_media_gb":           ram_summary["media_gb"],
             "ram_amostras":           ram_summary["amostras"],
+            "ram_processo_inicio_gb":     ram_summary["processo_inicio_gb"],
+            "ram_processo_fim_gb":        ram_summary["processo_fim_gb"],
+            "ram_processo_pico_gb":       ram_summary["processo_pico_gb"],
+            "ram_processo_media_gb":      ram_summary["processo_media_gb"],
+            "ram_processo_delta_pico_gb": ram_summary["processo_delta_pico_gb"],
+            "ram_processo_amostras":      ram_summary["processo_amostras"],
+            "ram_sistema_inicio_gb":      ram_summary["sistema_inicio_gb"],
+            "ram_sistema_fim_gb":         ram_summary["sistema_fim_gb"],
+            "ram_sistema_pico_gb":        ram_summary["sistema_pico_gb"],
+            "ram_sistema_media_gb":       ram_summary["sistema_media_gb"],
+            "ram_sistema_delta_pico_gb":  ram_summary["sistema_delta_pico_gb"],
+            "ram_sistema_pico_pct":       ram_summary["sistema_pico_pct"],
+            "ram_sistema_media_pct":      ram_summary["sistema_media_pct"],
+            "ram_sistema_amostras":       ram_summary["sistema_amostras"],
             # [PAR-4]
             "cpu_pico_pct":           cpu_summary["pico_pct"],
             "cpu_media_pct":          cpu_summary["media_pct"],
@@ -1190,9 +1747,20 @@ def run_phase_gcg():
             f"Iteracoes totais: {total_iteracoes}/{Config.GCG_NUM_STEPS * len(PROMPT_BATTERY)}"
         )
         print(
-            f"     VRAM pico : {vram_peak:.3f} GB | "
-            f"RAM pico: {ram_summary['pico_gb']:.3f} GB | "
-            f"RAM media: {ram_summary['media_gb']:.3f} GB"
+            f"     VRAM gerador usada: {vram_summary['processo_delta_pico_gb']:.3f} GB | "
+            f"inicio={vram_summary['processo_inicio_gb']:.3f} GB | "
+            f"pico={vram_summary['processo_pico_gb']:.3f} GB | "
+            f"reservada_pico={vram_summary['reservada_pico_gb']:.3f} GB"
+        )
+        print(
+            f"     VRAM GPU total durante GCG: delta={vram_summary['sistema_delta_pico_gb']:.3f} GB | "
+            f"inicio={vram_summary['sistema_inicio_gb']:.3f} GB | "
+            f"pico={vram_summary['sistema_pico_gb']:.3f} GB"
+        )
+        print(
+            f"     RAM sistema durante GCG: delta={ram_summary['sistema_delta_pico_gb']:.3f} GB | "
+            f"inicio={ram_summary['sistema_inicio_gb']:.3f} GB | "
+            f"pico={ram_summary['sistema_pico_gb']:.3f} GB"
         )
         print(
             f"     CPU pico  : {cpu_summary['pico_pct']:.1f}% | "
@@ -1201,6 +1769,7 @@ def run_phase_gcg():
 
     except Exception as e:
         ram_monitor.stop()
+        vram_monitor.stop()
         cpu_monitor.stop()
         print(f"[ERRO] Fase GCG: {e}")
         traceback.print_exc()
@@ -1230,7 +1799,7 @@ async def run_phase_pyrit():
     print(
         f"\n--- FASE 2: avaliacao da bateria "
         f"({len(PROMPT_BATTERY)} prompts x {Config.N_PROMPT_VARIATIONS} variacao | "
-        f"alvo: Meta-Llama-3-8B-Instruct local) ---"
+        f"alvo: Qwen2.5-3B-Instruct local) ---"
     )
 
     metrics = AttackMetrics()
@@ -1253,16 +1822,25 @@ async def run_phase_pyrit():
 
     hf_token    = os.environ.get("HUGGINGFACE_TOKEN", Config.HUGGINGFACE_TOKEN)
     ram_monitor = RAMMonitor()
-    cpu_monitor = CPUMonitor()  # [PAR-4]
-
-    target = HFLocalTarget(
-        model_id=Config.TARGET_MODEL_ID,
-        max_new_tokens=256,
-        temperature=0.01,
-        hf_token=hf_token,
-    )
+    vram_monitor = VRAMMonitor()
+    cpu_monitor = CPUMonitor()
+    target = None
 
     try:
+        # Importante: a medicao de PyRIT comeca antes de carregar o modelo alvo.
+        # Assim o delta inclui PyRIT + carregamento do alvo + inferencia.
+        ram_monitor.start()
+        vram_monitor.start()
+        cpu_monitor.start()
+        t0 = time.perf_counter()
+
+        target = HFLocalTarget(
+            model_id=Config.TARGET_MODEL_ID,
+            max_new_tokens=256,
+            temperature=0.01,
+            hf_token=hf_token,
+        )
+
         entradas = []
         for item in PROMPT_BATTERY:
             pid      = item["id"]
@@ -1290,11 +1868,7 @@ async def run_phase_pyrit():
             scorers=[scorer],
         )
 
-        ram_monitor.start()
-        cpu_monitor.start()  # [PAR-4]
-        t0 = time.perf_counter()
-
-        print(f"\nEnviando {len(prompts_envio)} prompts ao Meta-Llama-3-8B-Instruct...")
+        print(f"\nEnviando {len(prompts_envio)} prompts ao Qwen2.5-3B-Instruct...")
         all_results = await orchestrator.send_prompts_async(prompt_list=prompts_envio)
 
         resultados_por_prompt: list[dict] = []
@@ -1349,18 +1923,34 @@ async def run_phase_pyrit():
 
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
-        cpu_monitor.stop()  # [PAR-4]
+        vram_monitor.stop()
+        cpu_monitor.stop()
         ram_summary = ram_monitor.summary()
-        cpu_summary = cpu_monitor.summary()  # [PAR-4]
+        vram_summary = vram_monitor.summary()
+        cpu_summary = cpu_monitor.summary()
         custo_hf    = target.custo_estimado()
 
         metrics.pyrit_metrics.update({
             "tempo_execucao_s":      round(dt, 2),
             "custo_api":             custo_hf,
+            **vram_summary_update_fields(vram_summary, "vram_pyrit_alvo_delta_pico_gb"),
             "ram_pico_gb":           ram_summary["pico_gb"],
             "ram_media_gb":          ram_summary["media_gb"],
             "ram_amostras":          ram_summary["amostras"],
-            # [PAR-4]
+            "ram_processo_inicio_gb":     ram_summary["processo_inicio_gb"],
+            "ram_processo_fim_gb":        ram_summary["processo_fim_gb"],
+            "ram_processo_pico_gb":       ram_summary["processo_pico_gb"],
+            "ram_processo_media_gb":      ram_summary["processo_media_gb"],
+            "ram_processo_delta_pico_gb": ram_summary["processo_delta_pico_gb"],
+            "ram_processo_amostras":      ram_summary["processo_amostras"],
+            "ram_sistema_inicio_gb":      ram_summary["sistema_inicio_gb"],
+            "ram_sistema_fim_gb":         ram_summary["sistema_fim_gb"],
+            "ram_sistema_pico_gb":        ram_summary["sistema_pico_gb"],
+            "ram_sistema_media_gb":       ram_summary["sistema_media_gb"],
+            "ram_sistema_delta_pico_gb":  ram_summary["sistema_delta_pico_gb"],
+            "ram_sistema_pico_pct":       ram_summary["sistema_pico_pct"],
+            "ram_sistema_media_pct":      ram_summary["sistema_media_pct"],
+            "ram_sistema_amostras":       ram_summary["sistema_amostras"],
             "cpu_pico_pct":          cpu_summary["pico_pct"],
             "cpu_media_pct":         cpu_summary["media_pct"],
             "cpu_amostras":          cpu_summary["amostras"],
@@ -1370,8 +1960,26 @@ async def run_phase_pyrit():
         metrics.timestamps["pyrit_end"] = datetime.now(timezone.utc).isoformat()
 
         print(
-            f"\n     RAM pico : {ram_summary['pico_gb']:.3f} GB | "
-            f"RAM media: {ram_summary['media_gb']:.3f} GB"
+            f"\n     VRAM PyRIT + alvo usada: {vram_summary['processo_delta_pico_gb']:.3f} GB | "
+            f"inicio={vram_summary['processo_inicio_gb']:.3f} GB | "
+            f"pico={vram_summary['processo_pico_gb']:.3f} GB | "
+            f"reservada_pico={vram_summary['reservada_pico_gb']:.3f} GB"
+        )
+        print(
+            f"     VRAM GPU total durante PyRIT: delta={vram_summary['sistema_delta_pico_gb']:.3f} GB | "
+            f"inicio={vram_summary['sistema_inicio_gb']:.3f} GB | "
+            f"pico={vram_summary['sistema_pico_gb']:.3f} GB"
+        )
+        print(
+            f"\n     RAM usada por PyRIT + alvo: {ram_summary['processo_delta_pico_gb']:.3f} GB | "
+            f"inicio={ram_summary['processo_inicio_gb']:.3f} GB | "
+            f"pico={ram_summary['processo_pico_gb']:.3f} GB | "
+            f"media={ram_summary['processo_media_gb']:.3f} GB"
+        )
+        print(
+            f"     RAM sistema durante PyRIT: delta={ram_summary['sistema_delta_pico_gb']:.3f} GB | "
+            f"inicio={ram_summary['sistema_inicio_gb']:.3f} GB | "
+            f"pico={ram_summary['sistema_pico_gb']:.3f} GB"
         )
         print(
             f"     CPU pico : {cpu_summary['pico_pct']:.1f}% | "
@@ -1390,12 +1998,14 @@ async def run_phase_pyrit():
 
     except Exception as e:
         ram_monitor.stop()
+        vram_monitor.stop()
         cpu_monitor.stop()
         print(f"\n[ERRO] Fase avaliacao: {e}")
         traceback.print_exc()
         raise
     finally:
-        target.unload()
+        if target is not None:
+            target.unload()
         reset_vram_stats()
 
 
@@ -1409,7 +2019,7 @@ def run_two_phase():
     if not env.get("HUGGINGFACE_TOKEN", ""):
         print(
             "\n[AVISO] HUGGINGFACE_TOKEN nao definido.\n"
-            "  O Meta-Llama-3-8B-Instruct (modelo alvo) e GATED — token obrigatorio.\n"
+            "  Usando modelos padrao publicos/nao gated: Llama/Unsloth como atacante e Qwen como alvo.\n"
         )
 
     print("\nIniciando experimento GCG + PyRIT  (ERAD 2026 — Bateria de Prompts)")
@@ -1433,13 +2043,13 @@ def run_two_phase():
     run_phase_download()
 
     try:
-        print("\n--- Executando FASE 1 (GCG | atacante: DeepSeek-R1-Distill-Llama-8B) ---")
+        print("\n--- Executando FASE 1 (GCG | atacante: Llama-3.2-3B-Instruct) ---")
         subprocess.run(
             [sys.executable, __file__, "--phase", "gcg"],
             env=env, check=True,
         )
 
-        print("\n--- Executando FASE 2 (avaliacao | alvo: Meta-Llama-3-8B-Instruct local) ---")
+        print("\n--- Executando FASE 2 (avaliacao | alvo: Qwen2.5-3B-Instruct local) ---")
         subprocess.run(
             [sys.executable, __file__, "--phase", "pyrit"],
             env=env, check=True,
@@ -1463,8 +2073,8 @@ def parse_args():
         choices=["download", "gcg", "pyrit"],
         help=(
             "  download : baixa ambos os modelos do HuggingFace Hub\n"
-            "  gcg      : gera sufixo adversarial (DeepSeek-R1-Distill-Llama-8B)\n"
-            "  pyrit    : avalia sufixo no Meta-Llama-3-8B-Instruct local\n"
+            "  gcg      : gera sufixo adversarial (Llama-3.2-3B-Instruct)\n"
+            "  pyrit    : avalia sufixo no Qwen2.5-3B-Instruct local\n"
             "  [omitir] : executa as tres fases em sequencia (recomendado)"
         ),
     )
