@@ -28,6 +28,11 @@ CORRECOES ANTERIORES mantidas:
   [FIX-2] HFLocalTarget._infer: aplica apply_chat_template.
   [FIX-3] gerar_variacao_unica: usa apply_chat_template do tokenizador.
   [FIX-4] GCGAttack.run: seed resetado por prompt.
+
+ADICAO DE TIMELINES E USO DE GPU:
+  [TL-1] RAM/VRAM/CPU/GPU agora salvam series temporais em JSON.
+  [GPU-1] GPUMonitor coleta utilizacao percentual via nvidia-smi.
+  [GPU-2] Relatorio final inclui campos gpu_* por fase e chave timelines.
 """
 
 import argparse
@@ -162,7 +167,14 @@ class HFLocalTarget(PromptTarget):
         self._model_id       = model_id
         self._max_new_tokens = max_new_tokens
         self._temperature    = temperature
+
+        # [TOK] Contadores cumulativos de tokens usados pelo alvo local.
+        # O lock evita leituras inconsistentes pelo TokenUsageMonitor enquanto
+        # o PyRIT executa inferências em paralelo via executor/thread.
+        self.tokens_input     = 0
         self.tokens_generated = 0
+        self.tokens_total     = 0
+        self._tokens_lock     = threading.Lock()
 
         # [PAR-6] Usa resolve_local_model_path identico ao nanoGCG
         resolved = resolve_local_model_path(model_id)
@@ -213,11 +225,33 @@ class HFLocalTarget(PromptTarget):
                 continue
         return prompt_text
 
+    def _add_token_usage(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        """Atualiza contadores cumulativos de tokens com segurança de thread."""
+        input_tokens = int(input_tokens or 0)
+        output_tokens = int(output_tokens or 0)
+        with self._tokens_lock:
+            self.tokens_input += input_tokens
+            self.tokens_generated += output_tokens
+            self.tokens_total = self.tokens_input + self.tokens_generated
+
+    def tokens_snapshot(self) -> dict:
+        """Snapshot usado pelo TokenUsageMonitor a cada intervalo."""
+        with self._tokens_lock:
+            return {
+                "input_tokens": int(self.tokens_input),
+                "output_tokens": int(self.tokens_generated),
+                "total_tokens": int(self.tokens_total),
+            }
+
     def _infer(self, prompt_text: str) -> str:
         formatted = self._apply_chat_template(prompt_text)
         inputs = self._tokenizer(
             formatted, return_tensors="pt", truncation=True, max_length=1024,
         ).to(self._model.device)
+
+        input_tokens = int(inputs["input_ids"].numel())
+        self._add_token_usage(input_tokens=input_tokens)
+
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,
@@ -228,7 +262,7 @@ class HFLocalTarget(PromptTarget):
             )
         new_ids  = output_ids[0][inputs["input_ids"].shape[1]:]
         response = self._tokenizer.decode(new_ids, skip_special_tokens=True)
-        self.tokens_generated += len(new_ids)
+        self._add_token_usage(output_tokens=int(new_ids.numel()))
         return response.strip()
 
     async def send_prompt_async(self, *, prompt_request) -> "PromptRequestResponse":
@@ -286,8 +320,13 @@ class HFLocalTarget(PromptTarget):
         print("[OK] Modelo alvo descarregado da memoria.")
 
     def custo_estimado(self) -> dict:
+        snapshot = self.tokens_snapshot()
         return {
-            "tokens_gerados":  self.tokens_generated,
+            # Mantém a chave antiga para compatibilidade.
+            "tokens_gerados":  snapshot["output_tokens"],
+            "tokens_entrada":  snapshot["input_tokens"],
+            "tokens_saida":    snapshot["output_tokens"],
+            "tokens_total":    snapshot["total_tokens"],
             "custo_total_usd": 0.0,
             "nota":            "HuggingFace local — sem custo de API",
         }
@@ -298,9 +337,10 @@ class HFLocalTarget(PromptTarget):
 # =============================================================================
 
 class Config:
-    METRICS_JSON_PATH = "relatorio_gcg_llama3b_qwen_ram_vram.json"
+    METRICS_JSON_PATH = "relatorio_gcg_llama3b_qwen_ram_vram_gpu_timeline.json"
     SUFFIX_PATH       = "suffix_gcg_llama3b_qwen.json"
-    TEMP_METRICS_PATH = "temp_metrics_gcg_llama3b_qwen_ram_vram.json"
+    TEMP_METRICS_PATH = "temp_metrics_gcg_llama3b_qwen_ram_vram_gpu.json"
+    TEMP_TIMELINES_PATH = "temp_timelines_gcg_llama3b_qwen_ram_vram_gpu.json"
     DB_PATH           = "pyrit_history_gcg_llama3b_qwen.db"
 
     ATTACKER_MODEL_ID = "unsloth/Llama-3.2-3B-Instruct"
@@ -332,6 +372,8 @@ class Config:
     RAM_SAMPLE_INTERVAL   = 0.5
     VRAM_SAMPLE_INTERVAL  = 0.5  # intervalo de amostragem de VRAM
     CPU_SAMPLE_INTERVAL   = 0.5  # [PAR-4]
+    GPU_SAMPLE_INTERVAL   = 0.5  # [GPU-1] intervalo de amostragem de utilizacao da GPU
+    TOKEN_SAMPLE_INTERVAL = 0.5  # [TOK] intervalo de amostragem de tokens
 
     N_PROMPT_VARIATIONS = 1
 
@@ -380,56 +422,61 @@ def run_phase_download():
     print("\n[OK] Ambos os modelos disponiveis.\n")
 
 
+
 # =============================================================================
-# Monitor de RAM
+# Monitores com timeline: RAM, VRAM, GPU e CPU
 # =============================================================================
+
+# Estes monitores mantem os campos antigos de summary() e acrescentam timelines
+# com pontos {"t": segundos_relativos, "v": valor}. A coleta de GPU usa
+# nvidia-smi quando disponivel para medir utilizacao percentual real da GPU;
+# se nvidia-smi nao existir, o codigo continua funcionando e registra 0% para
+# uso da GPU, mantendo VRAM via torch.cuda.
+
+def _gb(value_bytes: int | float) -> float:
+    return float(value_bytes) / (1024 ** 3)
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
 
 class RAMMonitor:
     """
-    Monitora duas coisas ao mesmo tempo:
-      1) RAM RSS do processo Python atual, em GB.
-         - Na fase GCG, representa o processo que executa o gerador de sufixos.
-         - Na fase PyRIT, representa o processo que carrega PyRIT + modelo alvo.
-      2) RAM total usada pelo sistema, em GB, via psutil.virtual_memory().used.
-
-    Os campos de delta mostram quanto a fase realmente aumentou em relacao
-    ao inicio da propria fase: delta = pico - inicio.
+    Monitora RAM do processo Python e RAM total usada pelo sistema.
+    Tambem coleta timeline para graficos/Gantt.
     """
 
     def __init__(self, interval: float = Config.RAM_SAMPLE_INTERVAL):
         self._interval = interval
-        self._process_samples: list[float] = []
-        self._system_used_samples: list[float] = []
-        self._system_percent_samples: list[float] = []
-        self._stop    = threading.Event()
-        self._thread  = threading.Thread(target=self._run, daemon=True)
         self._process = psutil.Process(os.getpid())
+        self._proc_series: list[tuple[float, float]] = []
+        self._sys_used_series: list[tuple[float, float]] = []
+        self._sys_pct_series: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = 0.0
         self._process_start_rss_gb = 0.0
-        self._process_end_rss_gb   = 0.0
+        self._process_end_rss_gb = 0.0
         self._system_start_used_gb = 0.0
-        self._system_end_used_gb   = 0.0
-
-    @staticmethod
-    def _gb(value_bytes: int | float) -> float:
-        return float(value_bytes) / (1024 ** 3)
+        self._system_end_used_gb = 0.0
 
     def start(self):
         self._stop.clear()
-        self._process_samples.clear()
-        self._system_used_samples.clear()
-        self._system_percent_samples.clear()
+        self._proc_series.clear()
+        self._sys_used_series.clear()
+        self._sys_pct_series.clear()
+        self._t0 = time.perf_counter()
 
-        rss_inicio = self._gb(self._process.memory_info().rss)
+        rss = _gb(self._process.memory_info().rss)
         vm = psutil.virtual_memory()
-        self._process_start_rss_gb = rss_inicio
-        self._process_end_rss_gb   = rss_inicio
-        self._system_start_used_gb = self._gb(vm.used)
-        self._system_end_used_gb   = self._system_start_used_gb
-
-        # Amostra inicial explicita para calcular delta real da fase.
-        self._process_samples.append(rss_inicio)
-        self._system_used_samples.append(self._system_start_used_gb)
-        self._system_percent_samples.append(float(vm.percent))
+        self._process_start_rss_gb = rss
+        self._process_end_rss_gb = rss
+        self._system_start_used_gb = _gb(vm.used)
+        self._system_end_used_gb = self._system_start_used_gb
+        self._proc_series.append((0.0, rss))
+        self._sys_used_series.append((0.0, self._system_start_used_gb))
+        self._sys_pct_series.append((0.0, float(vm.percent)))
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -438,133 +485,116 @@ class RAMMonitor:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=self._interval * 3)
+        t = time.perf_counter() - self._t0 if self._t0 else 0.0
         try:
-            rss_fim = self._gb(self._process.memory_info().rss)
+            rss = _gb(self._process.memory_info().rss)
         except psutil.NoSuchProcess:
-            rss_fim = self._process_end_rss_gb
+            rss = self._process_end_rss_gb
         vm = psutil.virtual_memory()
-        self._process_end_rss_gb = rss_fim
-        self._system_end_used_gb = self._gb(vm.used)
-
-        # Amostra final explicita.
-        self._process_samples.append(rss_fim)
-        self._system_used_samples.append(self._system_end_used_gb)
-        self._system_percent_samples.append(float(vm.percent))
+        self._process_end_rss_gb = rss
+        self._system_end_used_gb = _gb(vm.used)
+        self._proc_series.append((t, rss))
+        self._sys_used_series.append((t, self._system_end_used_gb))
+        self._sys_pct_series.append((t, float(vm.percent)))
 
     def _run(self):
         while not self._stop.is_set():
+            t = time.perf_counter() - self._t0
             try:
-                rss = self._gb(self._process.memory_info().rss)
-                vm  = psutil.virtual_memory()
-                self._process_samples.append(rss)
-                self._system_used_samples.append(self._gb(vm.used))
-                self._system_percent_samples.append(float(vm.percent))
+                rss = _gb(self._process.memory_info().rss)
+                vm = psutil.virtual_memory()
+                self._proc_series.append((t, rss))
+                self._sys_used_series.append((t, _gb(vm.used)))
+                self._sys_pct_series.append((t, float(vm.percent)))
             except psutil.NoSuchProcess:
                 break
             self._stop.wait(self._interval)
 
-    @staticmethod
-    def _mean(values: list[float]) -> float:
-        return sum(values) / len(values) if values else 0.0
-
     @property
     def peak_gb(self) -> float:
-        return max(self._process_samples, default=0.0)
+        return max((v for _, v in self._proc_series), default=0.0)
 
     @property
     def mean_gb(self) -> float:
-        return self._mean(self._process_samples)
+        return _mean([v for _, v in self._proc_series])
 
     @property
     def system_peak_gb(self) -> float:
-        return max(self._system_used_samples, default=self._system_start_used_gb)
+        return max((v for _, v in self._sys_used_series), default=self._system_start_used_gb)
 
     @property
     def system_mean_gb(self) -> float:
-        return self._mean(self._system_used_samples)
+        return _mean([v for _, v in self._sys_used_series])
 
     @property
     def system_peak_percent(self) -> float:
-        return max(self._system_percent_samples, default=0.0)
+        return max((v for _, v in self._sys_pct_series), default=0.0)
 
     @property
     def system_mean_percent(self) -> float:
-        return self._mean(self._system_percent_samples)
+        return _mean([v for _, v in self._sys_pct_series])
+
+    def timelines(self) -> dict:
+        return {
+            "processo_gb": [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._proc_series],
+            "sistema_gb":  [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._sys_used_series],
+            "sistema_pct": [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._sys_pct_series],
+        }
 
     def summary(self) -> dict:
+        proc_vals = [v for _, v in self._proc_series]
+        sys_vals = [v for _, v in self._sys_used_series]
         processo_inicio = self._process_start_rss_gb
         processo_fim = self._process_end_rss_gb
         processo_pico = self.peak_gb
         processo_media = self.mean_gb
         processo_delta_pico = max(0.0, processo_pico - processo_inicio)
-
         sistema_pico = self.system_peak_gb
         sistema_media = self.system_mean_gb
         sistema_delta_pico = max(0.0, sistema_pico - self._system_start_used_gb)
         return {
-            # Compatibilidade com o codigo antigo: estes campos significam RAM absoluta do processo.
-            "pico_gb":  round(processo_pico, 3),
+            "pico_gb": round(processo_pico, 3),
             "media_gb": round(processo_media, 3),
-            "amostras": len(self._process_samples),
-
-            # RAM absoluta e delta do processo Python da fase.
-            "processo_inicio_gb":     round(processo_inicio, 3),
-            "processo_fim_gb":        round(processo_fim, 3),
-            "processo_pico_gb":       round(processo_pico, 3),
-            "processo_media_gb":      round(processo_media, 3),
+            "amostras": len(proc_vals),
+            "processo_inicio_gb": round(processo_inicio, 3),
+            "processo_fim_gb": round(processo_fim, 3),
+            "processo_pico_gb": round(processo_pico, 3),
+            "processo_media_gb": round(processo_media, 3),
             "processo_delta_pico_gb": round(processo_delta_pico, 3),
-            "processo_amostras":      len(self._process_samples),
-
-            # RAM total usada pelo sistema durante a fase.
-            "sistema_inicio_gb":      round(self._system_start_used_gb, 3),
-            "sistema_fim_gb":         round(self._system_end_used_gb, 3),
-            "sistema_pico_gb":        round(sistema_pico, 3),
-            "sistema_media_gb":       round(sistema_media, 3),
-            "sistema_delta_pico_gb":  round(sistema_delta_pico, 3),
-            "sistema_pico_pct":       round(self.system_peak_percent, 1),
-            "sistema_media_pct":      round(self.system_mean_percent, 1),
-            "sistema_amostras":       len(self._system_used_samples),
+            "processo_amostras": len(proc_vals),
+            "sistema_inicio_gb": round(self._system_start_used_gb, 3),
+            "sistema_fim_gb": round(self._system_end_used_gb, 3),
+            "sistema_pico_gb": round(sistema_pico, 3),
+            "sistema_media_gb": round(sistema_media, 3),
+            "sistema_delta_pico_gb": round(sistema_delta_pico, 3),
+            "sistema_pico_pct": round(self.system_peak_percent, 1),
+            "sistema_media_pct": round(self.system_mean_percent, 1),
+            "sistema_amostras": len(sys_vals),
+            "_timeline": self.timelines(),
         }
 
 
-
-# =============================================================================
-# Monitor de VRAM
-# =============================================================================
-
 class VRAMMonitor:
     """
-    Monitora VRAM de forma simetrica ao RAMMonitor:
-      1) VRAM alocada pelo PyTorch no processo atual, em GB.
-      2) VRAM reservada pelo cache do PyTorch, em GB.
-      3) VRAM total usada na(s) GPU(s), em GB, via torch.cuda.mem_get_info().
-
-    Observacao: se houver outros processos usando a GPU, eles entram em
-    vram_sistema_*, mas nao entram em vram_processo_*.
+    Monitora VRAM alocada/reservada pelo PyTorch e VRAM total usada na GPU.
+    Tambem coleta timeline para graficos/Gantt.
     """
 
     def __init__(self, interval: float = Config.VRAM_SAMPLE_INTERVAL):
         self._interval = interval
-        self._allocated_samples: list[float] = []
-        self._reserved_samples: list[float] = []
-        self._system_used_samples: list[float] = []
-        self._system_percent_samples: list[float] = []
+        self._alloc_series: list[tuple[float, float]] = []
+        self._reserv_series: list[tuple[float, float]] = []
+        self._sys_used_series: list[tuple[float, float]] = []
+        self._sys_pct_series: list[tuple[float, float]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = 0.0
         self._allocated_start_gb = 0.0
         self._allocated_end_gb = 0.0
         self._reserved_start_gb = 0.0
         self._reserved_end_gb = 0.0
         self._system_start_used_gb = 0.0
         self._system_end_used_gb = 0.0
-
-    @staticmethod
-    def _gb(value_bytes: int | float) -> float:
-        return float(value_bytes) / (1024 ** 3)
-
-    @staticmethod
-    def _mean(values: list[float]) -> float:
-        return sum(values) / len(values) if values else 0.0
 
     @staticmethod
     def _device_count() -> int:
@@ -587,29 +617,27 @@ class VRAMMonitor:
         reserved_gb = 0.0
         used_gb = 0.0
         total_gb = 0.0
-
         for idx in range(self._device_count()):
             try:
-                allocated_gb += self._gb(torch.cuda.memory_allocated(idx))
-                reserved_gb += self._gb(torch.cuda.memory_reserved(idx))
+                allocated_gb += _gb(torch.cuda.memory_allocated(idx))
+                reserved_gb += _gb(torch.cuda.memory_reserved(idx))
                 with torch.cuda.device(idx):
                     free_b, total_b = torch.cuda.mem_get_info()
-                used_gb += self._gb(total_b - free_b)
-                total_gb += self._gb(total_b)
+                used_gb += _gb(total_b - free_b)
+                total_gb += _gb(total_b)
             except Exception:
                 continue
-
         pct = (used_gb / total_gb * 100.0) if total_gb > 0 else 0.0
         return allocated_gb, reserved_gb, used_gb, pct
 
     def start(self):
         self._stop.clear()
-        self._allocated_samples.clear()
-        self._reserved_samples.clear()
-        self._system_used_samples.clear()
-        self._system_percent_samples.clear()
+        self._alloc_series.clear()
+        self._reserv_series.clear()
+        self._sys_used_series.clear()
+        self._sys_pct_series.clear()
         self._reset_peak_stats()
-
+        self._t0 = time.perf_counter()
         allocated, reserved, system_used, system_pct = self._read()
         self._allocated_start_gb = allocated
         self._allocated_end_gb = allocated
@@ -617,12 +645,10 @@ class VRAMMonitor:
         self._reserved_end_gb = reserved
         self._system_start_used_gb = system_used
         self._system_end_used_gb = system_used
-
-        self._allocated_samples.append(allocated)
-        self._reserved_samples.append(reserved)
-        self._system_used_samples.append(system_used)
-        self._system_percent_samples.append(system_pct)
-
+        self._alloc_series.append((0.0, allocated))
+        self._reserv_series.append((0.0, reserved))
+        self._sys_used_series.append((0.0, system_used))
+        self._sys_pct_series.append((0.0, system_pct))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -630,24 +656,24 @@ class VRAMMonitor:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=self._interval * 3)
-
+        t = time.perf_counter() - self._t0 if self._t0 else 0.0
         allocated, reserved, system_used, system_pct = self._read()
         self._allocated_end_gb = allocated
         self._reserved_end_gb = reserved
         self._system_end_used_gb = system_used
-
-        self._allocated_samples.append(allocated)
-        self._reserved_samples.append(reserved)
-        self._system_used_samples.append(system_used)
-        self._system_percent_samples.append(system_pct)
+        self._alloc_series.append((t, allocated))
+        self._reserv_series.append((t, reserved))
+        self._sys_used_series.append((t, system_used))
+        self._sys_pct_series.append((t, system_pct))
 
     def _run(self):
         while not self._stop.is_set():
+            t = time.perf_counter() - self._t0
             allocated, reserved, system_used, system_pct = self._read()
-            self._allocated_samples.append(allocated)
-            self._reserved_samples.append(reserved)
-            self._system_used_samples.append(system_used)
-            self._system_percent_samples.append(system_pct)
+            self._alloc_series.append((t, allocated))
+            self._reserv_series.append((t, reserved))
+            self._sys_used_series.append((t, system_used))
+            self._sys_pct_series.append((t, system_pct))
             self._stop.wait(self._interval)
 
     def _exact_allocated_peak_gb(self) -> float:
@@ -656,68 +682,77 @@ class VRAMMonitor:
         total = 0.0
         for idx in range(self._device_count()):
             try:
-                total += self._gb(torch.cuda.max_memory_allocated(idx))
+                total += _gb(torch.cuda.max_memory_allocated(idx))
             except Exception:
                 pass
         return total
 
     @property
     def peak_gb(self) -> float:
-        return max(max(self._allocated_samples, default=0.0), self._exact_allocated_peak_gb())
+        sampled = max((v for _, v in self._alloc_series), default=0.0)
+        return max(sampled, self._exact_allocated_peak_gb())
 
     @property
     def mean_gb(self) -> float:
-        return self._mean(self._allocated_samples)
+        return _mean([v for _, v in self._alloc_series])
 
     @property
     def system_peak_gb(self) -> float:
-        return max(self._system_used_samples, default=self._system_start_used_gb)
+        return max((v for _, v in self._sys_used_series), default=self._system_start_used_gb)
 
     @property
     def system_mean_gb(self) -> float:
-        return self._mean(self._system_used_samples)
+        return _mean([v for _, v in self._sys_used_series])
 
     @property
     def system_peak_percent(self) -> float:
-        return max(self._system_percent_samples, default=0.0)
+        return max((v for _, v in self._sys_pct_series), default=0.0)
 
     @property
     def system_mean_percent(self) -> float:
-        return self._mean(self._system_percent_samples)
+        return _mean([v for _, v in self._sys_pct_series])
+
+    def timelines(self) -> dict:
+        return {
+            "alocada_gb":   [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._alloc_series],
+            "reservada_gb": [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._reserv_series],
+            "sistema_gb":   [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._sys_used_series],
+            "sistema_pct":  [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._sys_pct_series],
+        }
 
     def summary(self) -> dict:
+        alloc_vals = [v for _, v in self._alloc_series]
+        reserv_vals = [v for _, v in self._reserv_series]
+        sys_vals = [v for _, v in self._sys_used_series]
         processo_inicio = self._allocated_start_gb
         processo_fim = self._allocated_end_gb
         processo_pico = self.peak_gb
         processo_media = self.mean_gb
         processo_delta_pico = max(0.0, processo_pico - processo_inicio)
-
         reservada_inicio = self._reserved_start_gb
         reservada_fim = self._reserved_end_gb
-        reservada_pico = max(self._reserved_samples, default=reservada_inicio)
-        reservada_media = self._mean(self._reserved_samples)
+        reservada_pico = max((v for _, v in self._reserv_series), default=reservada_inicio)
+        reservada_media = _mean(reserv_vals)
         reservada_delta_pico = max(0.0, reservada_pico - reservada_inicio)
-
         sistema_pico = self.system_peak_gb
         sistema_media = self.system_mean_gb
         sistema_delta_pico = max(0.0, sistema_pico - self._system_start_used_gb)
-
         return {
             "pico_gb": round(processo_pico, 3),
             "media_gb": round(processo_media, 3),
-            "amostras": len(self._allocated_samples),
+            "amostras": len(alloc_vals),
             "processo_inicio_gb": round(processo_inicio, 3),
             "processo_fim_gb": round(processo_fim, 3),
             "processo_pico_gb": round(processo_pico, 3),
             "processo_media_gb": round(processo_media, 3),
             "processo_delta_pico_gb": round(processo_delta_pico, 3),
-            "processo_amostras": len(self._allocated_samples),
+            "processo_amostras": len(alloc_vals),
             "reservada_inicio_gb": round(reservada_inicio, 3),
             "reservada_fim_gb": round(reservada_fim, 3),
             "reservada_pico_gb": round(reservada_pico, 3),
             "reservada_media_gb": round(reservada_media, 3),
             "reservada_delta_pico_gb": round(reservada_delta_pico, 3),
-            "reservada_amostras": len(self._reserved_samples),
+            "reservada_amostras": len(reserv_vals),
             "sistema_inicio_gb": round(self._system_start_used_gb, 3),
             "sistema_fim_gb": round(self._system_end_used_gb, 3),
             "sistema_pico_gb": round(sistema_pico, 3),
@@ -725,8 +760,617 @@ class VRAMMonitor:
             "sistema_delta_pico_gb": round(sistema_delta_pico, 3),
             "sistema_pico_pct": round(self.system_peak_percent, 1),
             "sistema_media_pct": round(self.system_mean_percent, 1),
-            "sistema_amostras": len(self._system_used_samples),
+            "sistema_amostras": len(sys_vals),
+            "_timeline": self.timelines(),
         }
+
+
+class GPUMonitor:
+    """
+    Monitora uso percentual real da GPU via nvidia-smi.
+
+    Campos principais:
+      - gpu_utilizacao_*: utilizacao compute da GPU, em %.
+      - gpu_memoria_*: memoria GPU usada segundo nvidia-smi, em GB.
+      - temperatura/potencia quando expostas pelo driver.
+
+    Se nvidia-smi nao estiver disponivel, o monitor nao falha; registra 0% de
+    utilizacao e tenta preencher memoria via torch.cuda.mem_get_info().
+    """
+
+    def __init__(self, interval: float | None = None):
+        self._interval = interval if interval is not None else getattr(Config, "GPU_SAMPLE_INTERVAL", 0.5)
+        self._util_mean_series: list[tuple[float, float]] = []
+        self._util_max_series: list[tuple[float, float]] = []
+        self._mem_used_series: list[tuple[float, float]] = []
+        self._mem_pct_series: list[tuple[float, float]] = []
+        self._temp_max_series: list[tuple[float, float]] = []
+        self._power_total_series: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = 0.0
+        self._available = None
+        self._device_count = 0
+
+    @staticmethod
+    def _as_float(value: str) -> float:
+        value = (value or "").strip().lower().replace("w", "").replace("[not supported]", "")
+        if value in ("", "n/a", "nan", "none"):
+            return 0.0
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    def _read_from_torch(self) -> tuple[float, float, float, float, float, float, int]:
+        if not torch.cuda.is_available():
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        used_gb = 0.0
+        total_gb = 0.0
+        count = torch.cuda.device_count()
+        for idx in range(count):
+            try:
+                with torch.cuda.device(idx):
+                    free_b, total_b = torch.cuda.mem_get_info()
+                used_gb += _gb(total_b - free_b)
+                total_gb += _gb(total_b)
+            except Exception:
+                pass
+        mem_pct = (used_gb / total_gb * 100.0) if total_gb else 0.0
+        return 0.0, 0.0, used_gb, mem_pct, 0.0, 0.0, count
+
+    def _read(self) -> tuple[float, float, float, float, float, float, int]:
+        query = (
+            "utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
+        )
+        cmd = [
+            "nvidia-smi",
+            f"--query-gpu={query}",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            out = subprocess.check_output(
+                cmd,
+                stderr=subprocess.DEVNULL,
+                timeout=max(1.0, min(3.0, self._interval * 2)),
+                text=True,
+            )
+        except Exception:
+            self._available = False
+            return self._read_from_torch()
+
+        utils: list[float] = []
+        mem_used_gb = 0.0
+        mem_total_gb = 0.0
+        temps: list[float] = []
+        powers: list[float] = []
+        for line in out.strip().splitlines():
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            while len(parts) < 5:
+                parts.append("0")
+            util = self._as_float(parts[0])
+            mem_used_mb = self._as_float(parts[1])
+            mem_total_mb = self._as_float(parts[2])
+            temp = self._as_float(parts[3])
+            power = self._as_float(parts[4])
+            utils.append(util)
+            mem_used_gb += mem_used_mb / 1024.0
+            mem_total_gb += mem_total_mb / 1024.0
+            temps.append(temp)
+            powers.append(power)
+        self._available = True
+        self._device_count = len(utils)
+        util_mean = _mean(utils)
+        util_max = max(utils, default=0.0)
+        mem_pct = (mem_used_gb / mem_total_gb * 100.0) if mem_total_gb > 0 else 0.0
+        temp_max = max(temps, default=0.0)
+        power_total = sum(powers)
+        return util_mean, util_max, mem_used_gb, mem_pct, temp_max, power_total, len(utils)
+
+    def start(self):
+        self._stop.clear()
+        self._util_mean_series.clear()
+        self._util_max_series.clear()
+        self._mem_used_series.clear()
+        self._mem_pct_series.clear()
+        self._temp_max_series.clear()
+        self._power_total_series.clear()
+        self._t0 = time.perf_counter()
+        self._append_sample(0.0)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._interval * 3)
+        t = time.perf_counter() - self._t0 if self._t0 else 0.0
+        self._append_sample(t)
+
+    def _append_sample(self, t: float):
+        util_mean, util_max, mem_used, mem_pct, temp_max, power_total, count = self._read()
+        self._device_count = max(self._device_count, count)
+        self._util_mean_series.append((t, util_mean))
+        self._util_max_series.append((t, util_max))
+        self._mem_used_series.append((t, mem_used))
+        self._mem_pct_series.append((t, mem_pct))
+        self._temp_max_series.append((t, temp_max))
+        self._power_total_series.append((t, power_total))
+
+    def _run(self):
+        while not self._stop.is_set():
+            t = time.perf_counter() - self._t0
+            self._append_sample(t)
+            self._stop.wait(self._interval)
+
+    def timelines(self) -> dict:
+        return {
+            "utilizacao_media_pct": [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._util_mean_series],
+            "utilizacao_max_pct":   [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._util_max_series],
+            "memoria_usada_gb":     [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._mem_used_series],
+            "memoria_pct":          [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._mem_pct_series],
+            "temperatura_max_c":    [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._temp_max_series],
+            "potencia_total_w":     [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._power_total_series],
+        }
+
+    def summary(self) -> dict:
+        util_mean_vals = [v for _, v in self._util_mean_series]
+        util_max_vals = [v for _, v in self._util_max_series]
+        mem_vals = [v for _, v in self._mem_used_series]
+        mem_pct_vals = [v for _, v in self._mem_pct_series]
+        temp_vals = [v for _, v in self._temp_max_series]
+        power_vals = [v for _, v in self._power_total_series]
+        return {
+            "utilizacao_pico_pct": round(max(util_mean_vals, default=0.0), 1),
+            "utilizacao_media_pct": round(_mean(util_mean_vals), 1),
+            "utilizacao_max_pico_pct": round(max(util_max_vals, default=0.0), 1),
+            "memoria_usada_pico_gb": round(max(mem_vals, default=0.0), 3),
+            "memoria_usada_media_gb": round(_mean(mem_vals), 3),
+            "memoria_pct_pico": round(max(mem_pct_vals, default=0.0), 1),
+            "temperatura_pico_c": round(max(temp_vals, default=0.0), 1),
+            "potencia_media_w": round(_mean(power_vals), 1),
+            "amostras": len(util_mean_vals),
+            "disponivel_nvidia_smi": bool(self._available),
+            "gpus_detectadas": self._device_count,
+            "_timeline": self.timelines(),
+        }
+
+
+class CPUMonitor:
+    """Coleta uso percentual de CPU com timestamps."""
+
+    def __init__(self, interval: float = Config.CPU_SAMPLE_INTERVAL):
+        self._interval = interval
+        self._series: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = 0.0
+
+    def start(self):
+        self._stop.clear()
+        self._series.clear()
+        self._t0 = time.perf_counter()
+        psutil.cpu_percent(interval=None)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._interval * 3)
+
+    def _run(self):
+        while not self._stop.is_set():
+            t = time.perf_counter() - self._t0
+            pct = psutil.cpu_percent(interval=None)
+            self._series.append((t, pct))
+            self._stop.wait(self._interval)
+
+    @property
+    def peak_pct(self) -> float:
+        return max((v for _, v in self._series), default=0.0)
+
+    @property
+    def mean_pct(self) -> float:
+        return _mean([v for _, v in self._series])
+
+    def timelines(self) -> dict:
+        return {
+            "cpu_pct": [{"t": round(t, 3), "v": round(v, 6)} for t, v in self._series],
+        }
+
+    def summary(self) -> dict:
+        return {
+            "pico_pct": round(self.peak_pct, 1),
+            "media_pct": round(self.mean_pct, 1),
+            "amostras": len(self._series),
+            "_timeline": self.timelines(),
+        }
+
+
+
+class TokenUsageMonitor:
+    """
+    Coleta timeline de uso de tokens em intervalos fixos.
+
+    O provider deve retornar:
+      input_tokens, output_tokens, total_tokens.
+
+    Para a fase GCG, esse provider vem do GCGTokenWorkloadCounter e representa
+    token workload processado/avaliado pelo gerador de sufixos.
+    Para a fase PyRIT, representa tokens reais de entrada/saída do alvo local.
+    """
+
+    def __init__(self, counter_provider=None, interval: float | None = None):
+        self._interval = interval if interval is not None else getattr(Config, "TOKEN_SAMPLE_INTERVAL", 0.5)
+        self._counter_provider = counter_provider
+        self._input_series: list[tuple[float, float]] = []
+        self._output_series: list[tuple[float, float]] = []
+        self._total_series: list[tuple[float, float]] = []
+        self._input_rate_series: list[tuple[float, float]] = []
+        self._output_rate_series: list[tuple[float, float]] = []
+        self._total_rate_series: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._t0 = 0.0
+        self._last_t = 0.0
+        self._last_input = 0.0
+        self._last_output = 0.0
+        self._last_total = 0.0
+
+    def set_counter_provider(self, counter_provider) -> None:
+        self._counter_provider = counter_provider
+
+    def _read(self) -> tuple[float, float, float]:
+        if self._counter_provider is None:
+            return 0.0, 0.0, 0.0
+        try:
+            snap = self._counter_provider()
+        except Exception:
+            return self._last_input, self._last_output, self._last_total
+        input_tokens = float(snap.get("input_tokens", snap.get("tokens_entrada", 0.0)) or 0.0)
+        output_tokens = float(snap.get("output_tokens", snap.get("tokens_saida", snap.get("tokens_gerados", 0.0))) or 0.0)
+        total_tokens = float(snap.get("total_tokens", snap.get("tokens_total", input_tokens + output_tokens)) or 0.0)
+        return input_tokens, output_tokens, total_tokens
+
+    def start(self):
+        self._stop.clear()
+        self._input_series.clear()
+        self._output_series.clear()
+        self._total_series.clear()
+        self._input_rate_series.clear()
+        self._output_rate_series.clear()
+        self._total_rate_series.clear()
+        self._t0 = time.perf_counter()
+        self._last_t = 0.0
+        self._last_input, self._last_output, self._last_total = self._read()
+        self._append_sample(0.0, force_zero_rate=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._interval * 3)
+        t = time.perf_counter() - self._t0 if self._t0 else 0.0
+        self._append_sample(t)
+
+    def _append_sample(self, t: float, force_zero_rate: bool = False):
+        input_tokens, output_tokens, total_tokens = self._read()
+        dt = max(1e-9, t - self._last_t)
+        if force_zero_rate:
+            input_rate = output_rate = total_rate = 0.0
+        else:
+            input_rate = max(0.0, (input_tokens - self._last_input) / dt)
+            output_rate = max(0.0, (output_tokens - self._last_output) / dt)
+            total_rate = max(0.0, (total_tokens - self._last_total) / dt)
+
+        self._input_series.append((t, input_tokens))
+        self._output_series.append((t, output_tokens))
+        self._total_series.append((t, total_tokens))
+        self._input_rate_series.append((t, input_rate))
+        self._output_rate_series.append((t, output_rate))
+        self._total_rate_series.append((t, total_rate))
+
+        self._last_t = t
+        self._last_input = input_tokens
+        self._last_output = output_tokens
+        self._last_total = total_tokens
+
+    def _run(self):
+        while not self._stop.is_set():
+            t = time.perf_counter() - self._t0
+            self._append_sample(t)
+            self._stop.wait(self._interval)
+
+    def timelines(self) -> dict:
+        return {
+            "tokens_entrada_acumulados": [
+                {"t": round(t, 3), "v": int(v)} for t, v in self._input_series
+            ],
+            "tokens_saida_acumulados": [
+                {"t": round(t, 3), "v": int(v)} for t, v in self._output_series
+            ],
+            "tokens_total_acumulados": [
+                {"t": round(t, 3), "v": int(v)} for t, v in self._total_series
+            ],
+            "tokens_entrada_por_s": [
+                {"t": round(t, 3), "v": round(v, 6)} for t, v in self._input_rate_series
+            ],
+            "tokens_saida_por_s": [
+                {"t": round(t, 3), "v": round(v, 6)} for t, v in self._output_rate_series
+            ],
+            "tokens_total_por_s": [
+                {"t": round(t, 3), "v": round(v, 6)} for t, v in self._total_rate_series
+            ],
+        }
+
+    def summary(self) -> dict:
+        input_vals = [v for _, v in self._input_series]
+        output_vals = [v for _, v in self._output_series]
+        total_vals = [v for _, v in self._total_series]
+        input_rate_vals = [v for _, v in self._input_rate_series]
+        output_rate_vals = [v for _, v in self._output_rate_series]
+        total_rate_vals = [v for _, v in self._total_rate_series]
+        duration_s = self._total_series[-1][0] if self._total_series else 0.0
+        total_delta = max(0.0, (total_vals[-1] - total_vals[0]) if len(total_vals) >= 2 else 0.0)
+        input_delta = max(0.0, (input_vals[-1] - input_vals[0]) if len(input_vals) >= 2 else 0.0)
+        output_delta = max(0.0, (output_vals[-1] - output_vals[0]) if len(output_vals) >= 2 else 0.0)
+        duration_safe = duration_s if duration_s > 0 else 1e-9
+        return {
+            "tokens_entrada_total": int(input_vals[-1]) if input_vals else 0,
+            "tokens_saida_total": int(output_vals[-1]) if output_vals else 0,
+            "tokens_total": int(total_vals[-1]) if total_vals else 0,
+            "tokens_entrada_delta": int(input_delta),
+            "tokens_saida_delta": int(output_delta),
+            "tokens_total_delta": int(total_delta),
+            "tokens_pico_acumulado": int(max(total_vals, default=0.0)),
+            "tokens_media_acumulado": round(_mean(total_vals), 3),
+            "tokens_taxa_pico_por_s": round(max(total_rate_vals, default=0.0), 3),
+            "tokens_taxa_media_por_s": round(total_delta / duration_safe, 3),
+            "tokens_entrada_taxa_pico_por_s": round(max(input_rate_vals, default=0.0), 3),
+            "tokens_entrada_taxa_media_por_s": round(input_delta / duration_safe, 3),
+            "tokens_saida_taxa_pico_por_s": round(max(output_rate_vals, default=0.0), 3),
+            "tokens_saida_taxa_media_por_s": round(output_delta / duration_safe, 3),
+            "tokens_amostras": len(total_vals),
+            "tokens_duracao_s": round(duration_s, 3),
+            "_timeline": self.timelines(),
+        }
+
+
+class GCGTokenWorkloadCounter:
+    """
+    Contador de token workload para GCG embedding direta.
+
+    A cada step, o GCG direto faz:
+      1) uma passagem de gradiente com prefixo + sufixo + target_prefix/loss;
+      2) search_width avaliações candidatas com prefixo + sufixo candidato.
+
+    Para manter a métrica comparável e legível no gráfico, o contador registra
+    por componente:
+      - prompt/context tokens;
+      - candidate suffix tokens;
+      - target-prefix/loss tokens.
+
+    O eixo Y deve ser descrito como "tokens processed/evaluated", não como
+    "tokens emitted", porque GCG otimiza/avalia candidatos de sufixo.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tokenizer = None
+        self._t0 = time.perf_counter()
+
+        self.prompt_context_tokens = 0
+        self.candidate_suffix_tokens = 0
+        self.target_prefix_tokens = 0
+        self.total_tokens = 0
+
+        self._active = None
+        self._component_series = {
+            "tokens_prompt_context_acumulados": [],
+            "tokens_candidate_suffix_acumulados": [],
+            "tokens_target_prefix_acumulados": [],
+            "tokens_total_workload_acumulados": [],
+        }
+        self._prompt_summaries = []
+
+    def set_tokenizer(self, tokenizer) -> None:
+        self._tokenizer = tokenizer
+
+    def _now(self) -> float:
+        return round(time.perf_counter() - self._t0, 3)
+
+    def _count_ids(self, text: str, *, add_special_tokens: bool = False) -> int:
+        text = "" if text is None else str(text)
+        if self._tokenizer is None:
+            return max(1, len(text.split())) if text.strip() else 0
+        try:
+            return int(len(self._tokenizer.encode(text, add_special_tokens=add_special_tokens)))
+        except Exception:
+            try:
+                encoded = self._tokenizer(text, add_special_tokens=add_special_tokens)
+                return int(len(encoded.get("input_ids", [])))
+            except Exception:
+                return max(1, len(text.split())) if text.strip() else 0
+
+    def start_prompt(
+        self,
+        *,
+        prompt_id: str,
+        prefix_text: str,
+        target_prefix: str,
+        search_width: int,
+        suffix_len: int,
+    ) -> None:
+        context_len = self._count_ids(prefix_text, add_special_tokens=True)
+        target_len = self._count_ids(target_prefix, add_special_tokens=False)
+        with self._lock:
+            self._active = {
+                "prompt_id": prompt_id,
+                "context_len": int(context_len),
+                "target_len": int(target_len),
+                "search_width": max(1, int(search_width or 1)),
+                "suffix_len": max(1, int(suffix_len or 1)),
+                "last_recorded_step": 0,
+                "prompt_context_tokens": 0,
+                "candidate_suffix_tokens": 0,
+                "target_prefix_tokens": 0,
+                "total_tokens": 0,
+            }
+            self._append_component_sample_locked()
+
+    def record_step(self, step: int) -> None:
+        with self._lock:
+            if self._active is None:
+                return
+
+            step = int(step or 0)
+            last = int(self._active.get("last_recorded_step", 0))
+            if step <= last:
+                step = last + 1
+            delta_steps = max(0, step - last)
+            if delta_steps <= 0:
+                return
+
+            # +1 representa a passagem de gradiente; search_width representa
+            # as avaliações candidatas do step.
+            eval_multiplier = int(self._active["search_width"]) + 1
+
+            add_context = delta_steps * eval_multiplier * int(self._active["context_len"])
+            add_suffix = delta_steps * eval_multiplier * int(self._active["suffix_len"])
+            add_target = delta_steps * eval_multiplier * int(self._active["target_len"])
+            add_total = add_context + add_suffix + add_target
+
+            self.prompt_context_tokens += add_context
+            self.candidate_suffix_tokens += add_suffix
+            self.target_prefix_tokens += add_target
+            self.total_tokens += add_total
+
+            self._active["prompt_context_tokens"] += add_context
+            self._active["candidate_suffix_tokens"] += add_suffix
+            self._active["target_prefix_tokens"] += add_target
+            self._active["total_tokens"] += add_total
+            self._active["last_recorded_step"] = step
+
+            self._append_component_sample_locked()
+
+    def finish_prompt(self, *, expected_steps: int) -> dict:
+        with self._lock:
+            active = self._active
+
+        if active is None:
+            return {}
+
+        last = int(active.get("last_recorded_step", 0))
+        expected_steps = max(last, int(expected_steps or last or 0))
+        if expected_steps > last:
+            self.record_step(expected_steps)
+
+        with self._lock:
+            summary = {
+                "prompt_id": self._active["prompt_id"],
+                "tokens_prompt_context": int(self._active["prompt_context_tokens"]),
+                "tokens_candidate_suffix": int(self._active["candidate_suffix_tokens"]),
+                "tokens_target_prefix": int(self._active["target_prefix_tokens"]),
+                "tokens_workload_total": int(self._active["total_tokens"]),
+                "context_tokens_per_eval": int(self._active["context_len"]),
+                "target_prefix_tokens_per_eval": int(self._active["target_len"]),
+                "suffix_tokens_per_eval": int(self._active["suffix_len"]),
+                "search_width": int(self._active["search_width"]),
+                "steps_recorded": int(self._active["last_recorded_step"]),
+            }
+            self._prompt_summaries.append(summary)
+            self._active = None
+            self._append_component_sample_locked()
+            return summary
+
+    def _append_component_sample_locked(self) -> None:
+        t = self._now()
+        self._component_series["tokens_prompt_context_acumulados"].append(
+            {"t": t, "v": int(self.prompt_context_tokens)}
+        )
+        self._component_series["tokens_candidate_suffix_acumulados"].append(
+            {"t": t, "v": int(self.candidate_suffix_tokens)}
+        )
+        self._component_series["tokens_target_prefix_acumulados"].append(
+            {"t": t, "v": int(self.target_prefix_tokens)}
+        )
+        self._component_series["tokens_total_workload_acumulados"].append(
+            {"t": t, "v": int(self.total_tokens)}
+        )
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "input_tokens": int(self.prompt_context_tokens),
+                "output_tokens": int(self.candidate_suffix_tokens + self.target_prefix_tokens),
+                "total_tokens": int(self.total_tokens),
+            }
+
+    def timelines(self) -> dict:
+        with self._lock:
+            return {key: list(value) for key, value in self._component_series.items()}
+
+    def summary_fields(self) -> dict:
+        with self._lock:
+            return {
+                "tokens_workload_total_estimated": int(self.total_tokens),
+                "tokens_prompt_context_total": int(self.prompt_context_tokens),
+                "tokens_candidate_suffix_total": int(self.candidate_suffix_tokens),
+                "tokens_target_prefix_total": int(self.target_prefix_tokens),
+                "tokens_workload_por_prompt": list(self._prompt_summaries),
+            }
+
+
+def empty_token_metric_fields(alias_key: str | None = None) -> dict:
+    fields = {
+        "tokens_entrada_total": 0,
+        "tokens_saida_total": 0,
+        "tokens_total": 0,
+        "tokens_entrada_delta": 0,
+        "tokens_saida_delta": 0,
+        "tokens_total_delta": 0,
+        "tokens_pico_acumulado": 0,
+        "tokens_media_acumulado": 0.0,
+        "tokens_taxa_pico_por_s": 0.0,
+        "tokens_taxa_media_por_s": 0.0,
+        "tokens_entrada_taxa_pico_por_s": 0.0,
+        "tokens_entrada_taxa_media_por_s": 0.0,
+        "tokens_saida_taxa_pico_por_s": 0.0,
+        "tokens_saida_taxa_media_por_s": 0.0,
+        "tokens_amostras": 0,
+        "tokens_duracao_s": 0.0,
+    }
+    if alias_key:
+        fields[alias_key] = 0
+    return fields
+
+
+def token_summary_update_fields(summary: dict, alias_key: str | None = None) -> dict:
+    fields = {
+        "tokens_entrada_total": summary.get("tokens_entrada_total", 0),
+        "tokens_saida_total": summary.get("tokens_saida_total", 0),
+        "tokens_total": summary.get("tokens_total", 0),
+        "tokens_entrada_delta": summary.get("tokens_entrada_delta", 0),
+        "tokens_saida_delta": summary.get("tokens_saida_delta", 0),
+        "tokens_total_delta": summary.get("tokens_total_delta", 0),
+        "tokens_pico_acumulado": summary.get("tokens_pico_acumulado", 0),
+        "tokens_media_acumulado": summary.get("tokens_media_acumulado", 0.0),
+        "tokens_taxa_pico_por_s": summary.get("tokens_taxa_pico_por_s", 0.0),
+        "tokens_taxa_media_por_s": summary.get("tokens_taxa_media_por_s", 0.0),
+        "tokens_entrada_taxa_pico_por_s": summary.get("tokens_entrada_taxa_pico_por_s", 0.0),
+        "tokens_entrada_taxa_media_por_s": summary.get("tokens_entrada_taxa_media_por_s", 0.0),
+        "tokens_saida_taxa_pico_por_s": summary.get("tokens_saida_taxa_pico_por_s", 0.0),
+        "tokens_saida_taxa_media_por_s": summary.get("tokens_saida_taxa_media_por_s", 0.0),
+        "tokens_amostras": summary.get("tokens_amostras", 0),
+        "tokens_duracao_s": summary.get("tokens_duracao_s", 0.0),
+    }
+    if alias_key:
+        fields[alias_key] = summary.get("tokens_total", 0)
+    return fields
 
 
 def empty_vram_metric_fields(alias_key: str | None = None) -> dict:
@@ -792,54 +1436,104 @@ def vram_summary_update_fields(summary: dict, alias_key: str | None = None) -> d
         fields[alias_key] = summary["processo_delta_pico_gb"]
     return fields
 
-# =============================================================================
-# [PAR-4] Monitor de CPU
-# =============================================================================
 
-class CPUMonitor:
-    """
-    [PAR-4] Coleta uso percentual de CPU (todos os nucleos, intervalo=interval).
-    Identico ao CPUMonitor do nanoGCG para coleta simetrica.
-    """
+def empty_gpu_metric_fields(alias_key: str | None = None) -> dict:
+    fields = {
+        "gpu_utilizacao_pico_pct": 0.0,
+        "gpu_utilizacao_media_pct": 0.0,
+        "gpu_utilizacao_max_pico_pct": 0.0,
+        "gpu_memoria_usada_pico_gb": 0.0,
+        "gpu_memoria_usada_media_gb": 0.0,
+        "gpu_memoria_pct_pico": 0.0,
+        "gpu_temperatura_pico_c": 0.0,
+        "gpu_potencia_media_w": 0.0,
+        "gpu_amostras": 0,
+        "gpu_disponivel_nvidia_smi": False,
+        "gpu_gpus_detectadas": 0,
+    }
+    if alias_key:
+        fields[alias_key] = 0.0
+    return fields
 
-    def __init__(self, interval: float = Config.CPU_SAMPLE_INTERVAL):
-        self._interval = interval
-        self._samples: list[float] = []
-        self._stop    = threading.Event()
-        self._thread  = threading.Thread(target=self._run, daemon=True)
 
-    def start(self):
-        self._stop.clear()
-        self._samples.clear()
-        psutil.cpu_percent(interval=None)  # descarta primeira amostra (retorna 0.0)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+def gpu_summary_update_fields(summary: dict, alias_key: str | None = None) -> dict:
+    fields = {
+        "gpu_utilizacao_pico_pct": summary["utilizacao_pico_pct"],
+        "gpu_utilizacao_media_pct": summary["utilizacao_media_pct"],
+        "gpu_utilizacao_max_pico_pct": summary["utilizacao_max_pico_pct"],
+        "gpu_memoria_usada_pico_gb": summary["memoria_usada_pico_gb"],
+        "gpu_memoria_usada_media_gb": summary["memoria_usada_media_gb"],
+        "gpu_memoria_pct_pico": summary["memoria_pct_pico"],
+        "gpu_temperatura_pico_c": summary["temperatura_pico_c"],
+        "gpu_potencia_media_w": summary["potencia_media_w"],
+        "gpu_amostras": summary["amostras"],
+        "gpu_disponivel_nvidia_smi": summary["disponivel_nvidia_smi"],
+        "gpu_gpus_detectadas": summary["gpus_detectadas"],
+    }
+    if alias_key:
+        fields[alias_key] = summary["utilizacao_media_pct"]
+    return fields
 
-    def stop(self):
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=self._interval * 3)
 
-    def _run(self):
-        while not self._stop.is_set():
-            pct = psutil.cpu_percent(interval=None)
-            self._samples.append(pct)
-            self._stop.wait(self._interval)
+def save_metrics_with_timeline(json_path: str, gcg_tl: dict, pyrit_tl: dict) -> None:
+    """Insere timelines RAM/VRAM/CPU/GPU/tokens no relatório JSON já salvo."""
+    path = Path(json_path)
+    if not path.exists():
+        print(f"[AVISO] JSON nao encontrado: {json_path} — timeline nao salva.")
+        return
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
 
-    @property
-    def peak_pct(self) -> float:
-        return max(self._samples, default=0.0)
+    def _duration(tl_dicts: list[dict]) -> float:
+        mx = 0.0
+        for tl_dict in tl_dicts:
+            for series in tl_dict.values():
+                if series:
+                    mx = max(mx, float(series[-1].get("t", 0.0)))
+        return round(mx, 3)
 
-    @property
-    def mean_pct(self) -> float:
-        return sum(self._samples) / len(self._samples) if self._samples else 0.0
-
-    def summary(self) -> dict:
-        return {
-            "pico_pct":  round(self.peak_pct, 1),
-            "media_pct": round(self.mean_pct, 1),
-            "amostras":  len(self._samples),
-        }
+    data["timelines"] = {
+        "schema_version": "timeline_gpu_tokens_v3_token_workload",
+        "descricao": (
+            "Series temporais por fase para RAM, VRAM, CPU, utilizacao de GPU "
+            "e tokens. Na fase GCG, tokens significam workload processado/avaliado."
+        ),
+        "phases": [
+            {
+                "label": gcg_tl.get("phase_label", "GCG embedding direta"),
+                "duration_s": _duration([
+                    gcg_tl.get("ram", {}),
+                    gcg_tl.get("vram", {}),
+                    gcg_tl.get("cpu", {}),
+                    gcg_tl.get("gpu", {}),
+                    gcg_tl.get("tokens", {}),
+                ]),
+                "ram": gcg_tl.get("ram", {}),
+                "vram": gcg_tl.get("vram", {}),
+                "cpu": gcg_tl.get("cpu", {}),
+                "gpu": gcg_tl.get("gpu", {}),
+                "tokens": gcg_tl.get("tokens", {}),
+            },
+            {
+                "label": pyrit_tl.get("phase_label", "PyRIT + Alvo"),
+                "duration_s": _duration([
+                    pyrit_tl.get("ram", {}),
+                    pyrit_tl.get("vram", {}),
+                    pyrit_tl.get("cpu", {}),
+                    pyrit_tl.get("gpu", {}),
+                    pyrit_tl.get("tokens", {}),
+                ]),
+                "ram": pyrit_tl.get("ram", {}),
+                "vram": pyrit_tl.get("vram", {}),
+                "cpu": pyrit_tl.get("cpu", {}),
+                "gpu": pyrit_tl.get("gpu", {}),
+                "tokens": pyrit_tl.get("tokens", {}),
+            },
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"[OK] Timelines RAM/VRAM/CPU/GPU/tokens salvas em {json_path}")
 
 
 # =============================================================================
@@ -859,6 +1553,8 @@ class AttackMetrics:
             "detalhes_por_prompt":        [],
             "tempo_execucao_s":           0,
             **empty_vram_metric_fields("vram_gerador_sufixos_delta_pico_gb"),
+            **empty_gpu_metric_fields("gpu_gerador_sufixos_utilizacao_media_pct"),
+            **empty_token_metric_fields("tokens_gerador_sufixos_total"),
             # Compatibilidade: RAM do processo durante a fase GCG.
             "ram_pico_gb":                0.0,
             "ram_media_gb":               0.0,
@@ -892,6 +1588,8 @@ class AttackMetrics:
             "tempo_execucao_s":      0,
             "custo_api":             {},
             **empty_vram_metric_fields("vram_pyrit_alvo_delta_pico_gb"),
+            **empty_gpu_metric_fields("gpu_pyrit_alvo_utilizacao_media_pct"),
+            **empty_token_metric_fields("tokens_pyrit_alvo_total"),
             # Compatibilidade: RAM do processo durante a fase PyRIT/avaliacao.
             "ram_pico_gb":           0.0,
             "ram_media_gb":          0.0,
@@ -954,6 +1652,16 @@ class AttackMetrics:
             self.pyrit_metrics.get("vram_sistema_pico_gb", 0.0),
         )
         vram_pico_total = vram_pico_processo_total
+        gpu_pico_total = max(
+            self.gcg_metrics.get("gpu_utilizacao_pico_pct", 0.0),
+            self.pyrit_metrics.get("gpu_utilizacao_pico_pct", 0.0),
+            self.gcg_metrics.get("gpu_utilizacao_max_pico_pct", 0.0),
+            self.pyrit_metrics.get("gpu_utilizacao_max_pico_pct", 0.0),
+        )
+        gpu_memoria_pico_total = max(
+            self.gcg_metrics.get("gpu_memoria_usada_pico_gb", 0.0),
+            self.pyrit_metrics.get("gpu_memoria_usada_pico_gb", 0.0),
+        )
         return {
             "experimento": {
                 "modelo_atacante":        Config.ATTACKER_MODEL_ID,
@@ -1066,6 +1774,16 @@ class AttackMetrics:
                 "cpu_media_gcg_pct":      round(self.gcg_metrics["cpu_media_pct"], 1),
                 "cpu_pico_pyrit_pct":     round(self.pyrit_metrics["cpu_pico_pct"], 1),
                 "cpu_media_pyrit_pct":    round(self.pyrit_metrics["cpu_media_pct"], 1),
+                "gpu_pico_total_pct":     round(gpu_pico_total, 1),
+                "gpu_memoria_pico_total_gb": round(gpu_memoria_pico_total, 3),
+                "gpu_pico_gcg_pct":       round(self.gcg_metrics.get("gpu_utilizacao_pico_pct", 0.0), 1),
+                "gpu_media_gcg_pct":      round(self.gcg_metrics.get("gpu_utilizacao_media_pct", 0.0), 1),
+                "gpu_max_pico_gcg_pct":   round(self.gcg_metrics.get("gpu_utilizacao_max_pico_pct", 0.0), 1),
+                "gpu_memoria_gcg_pico_gb": round(self.gcg_metrics.get("gpu_memoria_usada_pico_gb", 0.0), 3),
+                "gpu_pico_pyrit_pct":     round(self.pyrit_metrics.get("gpu_utilizacao_pico_pct", 0.0), 1),
+                "gpu_media_pyrit_pct":    round(self.pyrit_metrics.get("gpu_utilizacao_media_pct", 0.0), 1),
+                "gpu_max_pico_pyrit_pct": round(self.pyrit_metrics.get("gpu_utilizacao_max_pico_pct", 0.0), 1),
+                "gpu_memoria_pyrit_pico_gb": round(self.pyrit_metrics.get("gpu_memoria_usada_pico_gb", 0.0), 3),
                 "ataques_bem_sucedidos":  self.pyrit_metrics["sucessos"],
                 "total_ataques":          self.pyrit_metrics["tentativas"],
                 "n_prompts_bateria":      len(PROMPT_BATTERY),
@@ -1073,6 +1791,13 @@ class AttackMetrics:
                 "custo_gcg_brl":          round(self.custos["gcg_brl"], 6),
                 "custo_api_usd":          0.0,
                 "tokens_gerados_alvo":    (custo_hf or {}).get("tokens_gerados", 0),
+                "tokens_entrada_pyrit":    int(self.pyrit_metrics.get("tokens_entrada_total", 0)),
+                "tokens_saida_pyrit":      int(self.pyrit_metrics.get("tokens_saida_total", 0)),
+                "tokens_total_pyrit":      int(self.pyrit_metrics.get("tokens_total", 0)),
+                "tokens_workload_gcg_estimated": int(self.gcg_metrics.get("tokens_workload_total_estimated", self.gcg_metrics.get("tokens_total", 0))),
+                "tokens_prompt_context_gcg": int(self.gcg_metrics.get("tokens_prompt_context_total", 0)),
+                "tokens_candidate_suffix_gcg": int(self.gcg_metrics.get("tokens_candidate_suffix_total", 0)),
+                "tokens_target_prefix_gcg": int(self.gcg_metrics.get("tokens_target_prefix_total", 0)),
             },
         }
 
@@ -1118,6 +1843,7 @@ class GCGAttack:
         topk:         int = Config.GCG_TOPK,
         suffix_len:   int = Config.GCG_SUFFIX_LEN,
         seed:         int = Config.GCG_SEED,
+        token_counter: GCGTokenWorkloadCounter | None = None,
     ):
         self.model        = model
         self.tokenizer    = tokenizer
@@ -1126,6 +1852,7 @@ class GCGAttack:
         self.topk         = topk
         self.suffix_len   = suffix_len
         self.seed         = seed
+        self.token_counter = token_counter
         self.device       = next(model.parameters()).device
 
     def _build_input_ids(
@@ -1213,7 +1940,7 @@ class GCGAttack:
         decoded = self.tokenizer.decode(suffix_ids[0], skip_special_tokens=True)
         return decoded.strip().lower().startswith(target_prefix.strip().lower())
 
-    def run(self, prefix_text: str, target_text: str) -> dict:
+    def run(self, prefix_text: str, target_text: str, prompt_id: str | None = None) -> dict:
         # [FIX-4] Seed por prompt
         torch.manual_seed(self.seed)
         if torch.cuda.is_available():
@@ -1233,6 +1960,15 @@ class GCGAttack:
 
         excl_id    = tok.encode("!", add_special_tokens=False)[0]
         suffix_ids = torch.full((1, self.suffix_len), excl_id, dtype=torch.long)
+
+        if self.token_counter is not None:
+            self.token_counter.start_prompt(
+                prompt_id=prompt_id or "prompt",
+                prefix_text=prefix_text,
+                target_prefix=target_text,
+                search_width=self.search_width,
+                suffix_len=self.suffix_len,
+            )
 
         best_loss   = float("inf")
         best_suffix = tok.decode(suffix_ids[0], skip_special_tokens=True)
@@ -1294,6 +2030,9 @@ class GCGAttack:
 
             suffix_ids = best_step_ids
 
+            if self.token_counter is not None:
+                self.token_counter.record_step(step + 1)
+
             if best_step_loss < best_loss:
                 best_loss   = best_step_loss
                 best_suffix = tok.decode(suffix_ids[0], skip_special_tokens=True)
@@ -1319,11 +2058,18 @@ class GCGAttack:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        token_workload_prompt = {}
+        if self.token_counter is not None:
+            token_workload_prompt = self.token_counter.finish_prompt(
+                expected_steps=iteracoes_executadas,
+            )
+
         return {
             "best_string":          best_suffix,
             "best_loss":            best_loss,
             "iteracoes_executadas": iteracoes_executadas,
             "first_success_step":   first_success_step,  # [PAR-5]
+            "token_workload":        token_workload_prompt,
         }
 
 
@@ -1352,6 +2098,27 @@ def gerar_variacao_unica(base_prompt: str, tokenizer=None) -> str:
                 except Exception:
                     continue
     return f"System: {ctx}\nUser: {base_prompt}\nAssistant:"
+
+
+def proteger_prompt_jinja_pyrit(texto: str) -> str:
+    """
+    Faz o PyRIT tratar o prompt como texto literal.
+
+    O PromptSendingOrchestrator cria internamente um SeedPrompt e o PyRIT
+    tenta renderizar o texto como template Jinja. Sufixos GCG podem conter
+    sequencias como {{, {%, {# ou caracteres aleatorios depois delas,
+    causando TemplateSyntaxError antes de chegar ao modelo alvo.
+
+    Envolver em um bloco raw faz o Jinja devolver exatamente o texto original,
+    sem interpretar o conteudo do prompt/sufixo.
+    """
+    if texto is None:
+        return ""
+    texto = str(texto)
+    # Caso extremamente raro: o proprio prompt contem o marcador de fechamento.
+    # Quebramos e reabrimos o bloco raw para preservar o texto literalmente.
+    texto = texto.replace("{% endraw %}", "{% endraw %}{{ '{% endraw %}' }}{% raw %}")
+    return "{% raw %}" + texto + "{% endraw %}"
 
 
 # =============================================================================
@@ -1511,6 +2278,12 @@ def imprimir_resumo(metrics: AttackMetrics, custo_hf: dict = None):
           f"(media: {r['cpu_media_gcg_pct']:.1f}%)")
     print(f"  CPU PyRIT pico  : {r['cpu_pico_pyrit_pct']:.1f}%  "
           f"(media: {r['cpu_media_pyrit_pct']:.1f}%)")
+    print(f"  GPU GCG uso     : pico={r['gpu_pico_gcg_pct']:.1f}% | "
+          f"media={r['gpu_media_gcg_pct']:.1f}% | "
+          f"mem_pico={r['gpu_memoria_gcg_pico_gb']:.3f} GB")
+    print(f"  GPU PyRIT uso   : pico={r['gpu_pico_pyrit_pct']:.1f}% | "
+          f"media={r['gpu_media_pyrit_pct']:.1f}% | "
+          f"mem_pico={r['gpu_memoria_pyrit_pico_gb']:.3f} GB")
     print(
         f"  ASR (geral)     : {d['asr_percentual']:.1f}%  "
         f"({r['ataques_bem_sucedidos']}/{r['total_ataques']})"
@@ -1587,14 +2360,23 @@ def run_phase_gcg():
     metrics.timestamps["start"] = datetime.now(timezone.utc).isoformat()
     ram_monitor = RAMMonitor()
     vram_monitor = VRAMMonitor()
+    gpu_monitor = GPUMonitor()  # [GPU-1]
     cpu_monitor = CPUMonitor()  # [PAR-4]
+
+    # [TOK-WORKLOAD] Tokens do GCG direto agora representam workload
+    # processado/avaliado pelo gerador de sufixos, por componente.
+    token_workload_counter = GCGTokenWorkloadCounter()
+    token_monitor = TokenUsageMonitor(counter_provider=token_workload_counter.snapshot)
+
     model       = None
     tokenizer   = None
 
     try:
         ram_monitor.start()
         vram_monitor.start()
+        gpu_monitor.start()  # [GPU-1]
         cpu_monitor.start()  # [PAR-4]
+        token_monitor.start()
         t0 = time.perf_counter()
 
         # [PAR-6] Usa resolve_local_model_path identico ao nanoGCG
@@ -1617,6 +2399,8 @@ def run_phase_gcg():
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        token_workload_counter.set_tokenizer(tokenizer)
 
         model.config.use_cache = False
         # [PAR-1] gradient_checkpointing_enable() REMOVIDO — condicao de VRAM identica
@@ -1654,10 +2438,11 @@ def run_phase_gcg():
                 topk=Config.GCG_TOPK,
                 suffix_len=Config.GCG_SUFFIX_LEN,
                 seed=Config.GCG_SEED,
+                token_counter=token_workload_counter,
             )
 
             t_prompt = time.perf_counter()
-            result   = attacker.run(prefix_text, Config.TARGET_PREFIX)
+            result   = attacker.run(prefix_text, Config.TARGET_PREFIX, prompt_id=prompt_id)
             t_prompt = round(time.perf_counter() - t_prompt, 2)
 
             sufixos_por_prompt[prompt_id] = result["best_string"]
@@ -1673,14 +2458,17 @@ def run_phase_gcg():
                 "first_success_step":   result["first_success_step"],
                 "tempo_s":              t_prompt,
                 "sufixo_adversarial":   result["best_string"],
+                "token_workload":       result.get("token_workload", {}),
             })
 
+            tw_total = result.get("token_workload", {}).get("tokens_workload_total", 0)
             print(
                 f"  [{prompt_id}] concluido | "
                 f"Loss: {result['best_loss']:.4f} | "
                 f"Tempo: {t_prompt}s | "
                 f"Iters: {result['iteracoes_executadas']} | "
                 f"1o sucesso: {result['first_success_step'] or 'nao atingido'} | "
+                f"Token workload estimado: {tw_total} | "
                 f"Sufixo: {result['best_string'][:50]}{'...' if len(result['best_string'])>50 else ''}"
             )
 
@@ -1691,11 +2479,17 @@ def run_phase_gcg():
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
         vram_monitor.stop()
+        gpu_monitor.stop()  # [GPU-1]
         cpu_monitor.stop()  # [PAR-4]
+        token_monitor.stop()
+
         ram_summary = ram_monitor.summary()
         vram_summary = vram_monitor.summary()
+        gpu_summary = gpu_monitor.summary()  # [GPU-1]
         vram_peak   = vram_summary["pico_gb"]
         cpu_summary = cpu_monitor.summary()  # [PAR-4]
+        token_summary = token_monitor.summary()
+        token_workload_summary = token_workload_counter.summary_fields()
 
         loss_media = total_loss / len(PROMPT_BATTERY) if PROMPT_BATTERY else 0.0
 
@@ -1708,6 +2502,9 @@ def run_phase_gcg():
             "detalhes_por_prompt":    detalhes_por_prompt,
             "tempo_execucao_s":       round(dt, 2),
             **vram_summary_update_fields(vram_summary, "vram_gerador_sufixos_delta_pico_gb"),
+            **gpu_summary_update_fields(gpu_summary, "gpu_gerador_sufixos_utilizacao_media_pct"),
+            **token_summary_update_fields(token_summary, "tokens_gerador_sufixos_total"),
+            **token_workload_summary,
             "ram_pico_gb":            ram_summary["pico_gb"],
             "ram_media_gb":           ram_summary["media_gb"],
             "ram_amostras":           ram_summary["amostras"],
@@ -1741,6 +2538,22 @@ def run_phase_gcg():
 
         metrics.save_temp(Config.TEMP_METRICS_PATH)
 
+        token_timeline = token_monitor.timelines()
+        token_timeline.update(token_workload_counter.timelines())
+
+        gcg_timelines = {
+            "phase_label": "GCG embedding direta",
+            "ram": ram_monitor.timelines(),
+            "vram": vram_monitor.timelines(),
+            "cpu": cpu_monitor.timelines(),
+            "gpu": gpu_monitor.timelines(),
+            "tokens": token_timeline,
+        }
+        Path(Config.TEMP_TIMELINES_PATH).write_text(
+            json.dumps({"gcg": gcg_timelines}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
         print(
             f"\n[OK] GCG concluido em {dt:.1f}s | "
             f"Loss media: {loss_media:.4f} | "
@@ -1766,11 +2579,27 @@ def run_phase_gcg():
             f"     CPU pico  : {cpu_summary['pico_pct']:.1f}% | "
             f"CPU media: {cpu_summary['media_pct']:.1f}%"
         )
+        print(
+            f"     GPU uso   : pico={gpu_summary['utilizacao_pico_pct']:.1f}% | "
+            f"media={gpu_summary['utilizacao_media_pct']:.1f}% | "
+            f"mem_pico={gpu_summary['memoria_usada_pico_gb']:.3f} GB"
+        )
+        print(
+            f"     Token workload GCG : "
+            f"total={token_workload_summary['tokens_workload_total_estimated']} | "
+            f"context={token_workload_summary['tokens_prompt_context_total']} | "
+            f"candidate_suffix={token_workload_summary['tokens_candidate_suffix_total']} | "
+            f"target_prefix={token_workload_summary['tokens_target_prefix_total']} | "
+            f"pico={token_summary['tokens_taxa_pico_por_s']:.2f} tok/s | "
+            f"media={token_summary['tokens_taxa_media_por_s']:.2f} tok/s"
+        )
 
     except Exception as e:
         ram_monitor.stop()
         vram_monitor.stop()
+        gpu_monitor.stop()
         cpu_monitor.stop()
+        token_monitor.stop()
         print(f"[ERRO] Fase GCG: {e}")
         traceback.print_exc()
         raise
@@ -1823,15 +2652,25 @@ async def run_phase_pyrit():
     hf_token    = os.environ.get("HUGGINGFACE_TOKEN", Config.HUGGINGFACE_TOKEN)
     ram_monitor = RAMMonitor()
     vram_monitor = VRAMMonitor()
+    gpu_monitor = GPUMonitor()  # [GPU-1]
     cpu_monitor = CPUMonitor()
     target = None
+    token_monitor = TokenUsageMonitor(
+        counter_provider=lambda: target.tokens_snapshot() if target is not None else {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+    )
 
     try:
         # Importante: a medicao de PyRIT comeca antes de carregar o modelo alvo.
         # Assim o delta inclui PyRIT + carregamento do alvo + inferencia.
         ram_monitor.start()
         vram_monitor.start()
+        gpu_monitor.start()  # [GPU-1]
         cpu_monitor.start()
+        token_monitor.start()
         t0 = time.perf_counter()
 
         target = HFLocalTarget(
@@ -1856,7 +2695,10 @@ async def run_phase_pyrit():
                 "variacao":        variacao,
             })
 
-        prompts_envio = [e["variacao"] for e in entradas]
+        # PyRIT interpreta cada prompt como template Jinja antes do envio.
+        # Os sufixos GCG podem conter sequencias Jinja aleatorias e quebrar
+        # com TemplateSyntaxError. O bloco raw preserva o texto literal.
+        prompts_envio = [proteger_prompt_jinja_pyrit(e["variacao"]) for e in entradas]
         metrics.pyrit_metrics["tentativas"] = len(prompts_envio)
 
         scorer = SubStringScorer(
@@ -1924,16 +2766,22 @@ async def run_phase_pyrit():
         dt          = time.perf_counter() - t0
         ram_monitor.stop()
         vram_monitor.stop()
+        gpu_monitor.stop()  # [GPU-1]
         cpu_monitor.stop()
+        token_monitor.stop()
         ram_summary = ram_monitor.summary()
         vram_summary = vram_monitor.summary()
+        gpu_summary = gpu_monitor.summary()  # [GPU-1]
         cpu_summary = cpu_monitor.summary()
+        token_summary = token_monitor.summary()
         custo_hf    = target.custo_estimado()
 
         metrics.pyrit_metrics.update({
             "tempo_execucao_s":      round(dt, 2),
             "custo_api":             custo_hf,
             **vram_summary_update_fields(vram_summary, "vram_pyrit_alvo_delta_pico_gb"),
+            **gpu_summary_update_fields(gpu_summary, "gpu_pyrit_alvo_utilizacao_media_pct"),
+            **token_summary_update_fields(token_summary, "tokens_pyrit_alvo_total"),
             "ram_pico_gb":           ram_summary["pico_gb"],
             "ram_media_gb":          ram_summary["media_gb"],
             "ram_amostras":          ram_summary["amostras"],
@@ -1986,20 +2834,58 @@ async def run_phase_pyrit():
             f"CPU media: {cpu_summary['media_pct']:.1f}%"
         )
         print(
-            f"     Tokens gerados (alvo): {custo_hf['tokens_gerados']} | "
+            f"     GPU uso  : pico={gpu_summary['utilizacao_pico_pct']:.1f}% | "
+            f"media={gpu_summary['utilizacao_media_pct']:.1f}% | "
+            f"mem_pico={gpu_summary['memoria_usada_pico_gb']:.3f} GB"
+        )
+        print(
+            f"     Tokens alvo/PyRIT: entrada={custo_hf.get('tokens_entrada', 0)} | "
+            f"saida={custo_hf.get('tokens_saida', custo_hf.get('tokens_gerados', 0))} | "
+            f"total={custo_hf.get('tokens_total', 0)} | "
+            f"pico={token_summary['tokens_taxa_pico_por_s']:.2f} tok/s | "
             f"Custo: US$ 0.00 (local)"
         )
 
         salvar_relatorio(metrics, custo_hf)
+
+        pyrit_timelines = {
+            "phase_label": "PyRIT + Alvo",
+            "ram": ram_monitor.timelines(),
+            "vram": vram_monitor.timelines(),
+            "cpu": cpu_monitor.timelines(),
+            "gpu": gpu_monitor.timelines(),
+            "tokens": token_monitor.timelines(),
+        }
+        gcg_timelines = {
+            "phase_label": "GCG embedding direta",
+            "ram": {}, "vram": {}, "cpu": {}, "gpu": {}, "tokens": {},
+        }
+        if Path(Config.TEMP_TIMELINES_PATH).exists():
+            try:
+                gcg_timelines = json.loads(
+                    Path(Config.TEMP_TIMELINES_PATH).read_text(encoding="utf-8")
+                ).get("gcg", gcg_timelines)
+            except Exception as exc:
+                print(f"[AVISO] Falha ao ler timeline temporaria: {exc}")
+        save_metrics_with_timeline(
+            json_path=Config.METRICS_JSON_PATH,
+            gcg_tl=gcg_timelines,
+            pyrit_tl=pyrit_timelines,
+        )
+
         imprimir_resumo(metrics, custo_hf)
 
         if Path(Config.TEMP_METRICS_PATH).exists():
             os.remove(Config.TEMP_METRICS_PATH)
+        if Path(Config.TEMP_TIMELINES_PATH).exists():
+            os.remove(Config.TEMP_TIMELINES_PATH)
 
     except Exception as e:
         ram_monitor.stop()
         vram_monitor.stop()
+        gpu_monitor.stop()
         cpu_monitor.stop()
+        token_monitor.stop()
         print(f"\n[ERRO] Fase avaliacao: {e}")
         traceback.print_exc()
         raise
@@ -2036,7 +2922,7 @@ def run_two_phase():
     )
     print(f"  [PARIDADE] gradient_checkpointing=False | attn=padrao | prefix=completo")
 
-    for f in [Config.TEMP_METRICS_PATH, Config.SUFFIX_PATH]:
+    for f in [Config.TEMP_METRICS_PATH, Config.TEMP_TIMELINES_PATH, Config.SUFFIX_PATH]:
         if Path(f).exists():
             os.remove(f)
 
